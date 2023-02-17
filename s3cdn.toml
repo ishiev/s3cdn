@@ -1,0 +1,8 @@
+[default]
+address = "127.0.0.1"
+port = 8000
+base_path = "/"
+log_level = "normal"
+
+[default.storage]
+root = "data"
