@@ -1,6 +1,7 @@
 use rocket::http::uri::Origin;
 use rocket::serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use s3::creds::Credentials;
 
 
 /// Configuration params for server
@@ -9,6 +10,7 @@ pub struct Config<'a> {
     pub ident: String,
     pub base_path: Origin<'a>,
     pub storage: ConfigStorage,
+    pub creds: Credentials,
 }
 
 impl Default for Config<'_> {
@@ -20,6 +22,7 @@ impl Default for Config<'_> {
             ),
             base_path: Origin::path_only("/"),
             storage: ConfigStorage::default(),
+            creds: Credentials::anonymous().expect("Error create anonymous AWS credentials"),
         }
     }
 }

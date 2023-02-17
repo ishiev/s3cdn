@@ -39,6 +39,8 @@ fn rocket() -> _ {
         config.ident
     );
 
+    println!("Config: {:?}", config);
+
     rocket::custom(figment)
         .manage(config)
         .mount(base_path, routes![index])
