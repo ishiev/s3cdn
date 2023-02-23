@@ -6,19 +6,23 @@ use s3::request::ResponseDataStream;
 use tokio_util::io::StreamReader;
 
 pub struct DataStreamResponder {
-    stream: ResponseDataStream, 
+    inner: ResponseDataStream, 
 }
 
 impl From<ResponseDataStream> for DataStreamResponder {
     fn from(s: ResponseDataStream) -> Self {
-        DataStreamResponder { stream: s }
+        DataStreamResponder { inner: s }
     }
 }
 
 impl<'r> Responder<'r, 'static> for DataStreamResponder {
     fn respond_to(self, _: &'r Request<'_>) -> response::Result<'static> {
-        let reader = StreamReader::new(self.stream.bytes);
-        Response::build()
+        let reader = StreamReader::new(self.inner.bytes);
+        let mut builder = Response::build();
+        for (header_name, header_value) in self.inner.headers.into_iter() {
+            builder.raw_header(header_name, header_value);
+        }
+        builder
             .streamed_body(reader)
             .ok()
     }
