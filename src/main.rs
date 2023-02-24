@@ -11,6 +11,8 @@ use rocket::{
         Figment, Profile,
     }, 
     State,
+    http::Status,
+    Request
 };
 mod config;
 use config::Config;
@@ -25,12 +27,31 @@ use s3::{
 enum Error {
     #[response(status = 404)]
     NotFound(String),
+    #[response(status = 403)]
+    Forbidden(String),
+    #[response(status = 503)]
+    Unavailable(String),
+    #[response(status = 500)]
+    Internal(String)
 }
 
 impl From<S3Error> for Error {
     fn from(e: S3Error) -> Self {
-        Error::NotFound(e.to_string())
+        match e {
+            S3Error::Http(404, _)   => Error::NotFound(e.to_string()),
+            S3Error::Http(403, _)   => Error::Forbidden(e.to_string()),
+            S3Error::Credentials(_) => Error::Forbidden(e.to_string()),
+            S3Error::MaxExpiry(_)   => Error::Unavailable(e.to_string()),
+            S3Error::HttpFail       => Error::Unavailable(e.to_string()),
+            S3Error::Reqwest(e)     => Error::Unavailable(e.to_string()),
+            _ => Error::Internal(e.to_string())
+        }
     }
+}
+
+#[catch(default)]
+fn default_catcher(status: Status, _: &Request) -> String {
+    format!("{}", status)
 }
 
 #[get("/<bucket_name>/<path..>")]
@@ -98,4 +119,5 @@ fn rocket() -> _ {
     rocket::custom(figment)
         .manage(config)
         .mount(base_path, routes![index])
+        .register("/", catchers![default_catcher])
 }

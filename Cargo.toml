@@ -12,9 +12,12 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 rocket = "0.5.0-rc.2"
 aws-region = { version = "0.25.1", features = ["serde"] }
-rust-s3 = { path = "../rust-s3/s3" }
+rust-s3 = { git = "https://github.com/ishiev/rust-s3.git" }
 serde = { version = "1", features = ["derive"] }
 url = { version = "2", features = ["serde"] }
+
+[patch."https://github.com/ishiev/rust-s3.git"]
+rust-s3 = { path = "../rust-s3/s3" }
 
 [profile.release]
 strip = true  # Automatically strip symbols from the binary.
