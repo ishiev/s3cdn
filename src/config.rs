@@ -56,6 +56,7 @@ pub struct ConfigConnection {
     pub region: Option<Region>,
     pub endpoint: Option<Url>,
     pub pathstyle: bool,
+    pub timeout: Option<u64>,
 }
 
 impl ConfigConnection {

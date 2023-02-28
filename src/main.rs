@@ -67,7 +67,9 @@ async fn index(
             config.connection.region.as_ref().unwrap().to_owned(), 
             config.creds.to_owned()
         )?;
-        bucket.set_request_timeout(Some(Duration::from_secs(5)));
+        // set timeout from config or infinite
+        bucket.set_request_timeout(config.connection.timeout.map(Duration::from_secs));
+        // set path- or virtual host bucket style 
         if config.connection.pathstyle {
             bucket.set_path_style();
         } else {
