@@ -12,16 +12,23 @@ use rocket::{
     }, 
     State,
     http::Status,
-    Request
+    Request,
 };
-mod config;
-use config::Config;
-mod responder;
-use responder::DataStreamResponder;
 use s3::{
     Bucket,
     error::S3Error,
 };
+
+mod config;
+mod responder;
+mod cache;
+
+use crate::{
+    config::Config,
+    responder::DataStreamResponder,
+    cache::ObjectCache,
+};
+
 
 #[derive(Responder)]
 enum Error {
@@ -108,6 +115,11 @@ fn rocket() -> _ {
         }
     }
 
+    println!("Config: {:?}", config);
+
+    // setup cache
+    let cache = ObjectCache::from(config.cache.take().unwrap_or_default());
+
     // set server base path from config
     let base_path = config.base_path.to_owned();
 
@@ -116,10 +128,9 @@ fn rocket() -> _ {
         config.ident
     );
 
-    println!("Config: {:?}", config);
-
     rocket::custom(figment)
         .manage(config)
+        .manage(cache)
         .mount(base_path, routes![index])
         .register("/", catchers![default_catcher])
 }

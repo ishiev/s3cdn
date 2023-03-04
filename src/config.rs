@@ -3,12 +3,12 @@ use serde::{
     Deserialize, 
     Serialize,
 };
-use std::path::PathBuf;
 use s3::{
     creds::Credentials,
     region::Region,
 };
 use url::Url;
+use crate::cache::ConfigObjectCache;
 
 
 /// Configuration params for server
@@ -16,36 +16,22 @@ use url::Url;
 pub struct Config<'a> {
     pub ident: String,
     pub base_path: Origin<'a>,
-    pub storage: ConfigStorage,
+    pub cache: Option<ConfigObjectCache>,
     pub creds: Credentials,
     pub connection: ConfigConnection,
 }
 
 impl Default for Config<'_> {
     fn default() -> Self {
-        Config {
+        Self {
             ident: format!("{}/{}", 
                 env!("CARGO_PKG_NAME"), 
                 env!("CARGO_PKG_VERSION")
             ),
             base_path: Origin::path_only("/"),
-            storage: ConfigStorage::default(),
+            cache: Default::default(),
             creds: Credentials::anonymous().expect("Error create anonymous AWS credentials"),
-            connection: ConfigConnection::default(),
-        }
-    }
-}
-
-/// Storage params
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ConfigStorage {
-    pub root: PathBuf,
-}
-
-impl Default for ConfigStorage {
-    fn default() -> Self {
-        ConfigStorage {
-            root: PathBuf::from("data"),
+            connection: Default::default(),
         }
     }
 }

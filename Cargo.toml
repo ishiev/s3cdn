@@ -15,6 +15,7 @@ aws-region = { version = "0.25.1", features = ["serde"] }
 rust-s3 = { git = "https://github.com/ishiev/rust-s3.git" }
 serde = { version = "1", features = ["derive"] }
 url = { version = "2", features = ["serde"] }
+cacache = { version = "*", default-features = false, features = ["tokio-runtime"] }
 
 [patch."https://github.com/ishiev/rust-s3.git"]
 rust-s3 = { path = "../rust-s3/s3" }
