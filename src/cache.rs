@@ -34,7 +34,7 @@ pub struct ConfigObjectCache {
     pub max_age: Option<u64>,
     pub max_size: Option<u64>,
     pub inactive: Option<u64>,
-    pub use_stale: Option<bool>,
+    pub use_stale: Option<u64>,
     pub background_update: Option<u64>,
 }
 
@@ -44,13 +44,13 @@ impl ConfigObjectCache {
             // default 10 sec fresh
             let max_age = self.max_age.unwrap_or(10); 
             // default not use stale resource
-            let use_stale = self.use_stale.unwrap_or(false);
-            let stale_directive = if use_stale {
+            let use_stale = self.use_stale.unwrap_or(0);
+            let stale_directive = if use_stale > 0 {
                 // use stale resource for 1 day
-                ", stale-while-revalidate=86400, stale-if-error=86400"
+                format!(", stale-while-revalidate={use_stale}, stale-if-error={use_stale}")
             } else {
                 // not use stale resource, must revalidate or return error
-                ", must-revalidate"
+                String::from(", must-revalidate")
             };
             vec![
                 Header::new("cache-control", format!("max-age={max_age}{stale_directive}"))
