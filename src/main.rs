@@ -26,7 +26,7 @@ mod cache;
 use crate::{
     config::Config,
     responder::DataStreamResponder,
-    cache::ObjectCache,
+    cache::{ObjectCache, CacheResponder},
 };
 
 
@@ -62,11 +62,12 @@ fn default_catcher(status: Status, _: &Request) -> String {
 }
 
 #[get("/<bucket_name>/<path..>")]
-async fn index(
+async fn index<'r>(
     bucket_name: &str,
     path: PathBuf,
     config: &State<Config<'_>>,
-) -> Result<DataStreamResponder, Error> {
+    cache: &'r State<ObjectCache>,
+) -> Result<CacheResponder<'r, 'static, DataStreamResponder>, Error> {
     // configure S3 Bucket
     let bucket = {
         let mut bucket = Bucket::new(
@@ -85,9 +86,12 @@ async fn index(
         bucket
     };
 
-    let response = bucket.get_object_stream(path.to_string_lossy()).await?;
+    let stream = bucket.get_object_stream(path.to_string_lossy()).await?;
 
-    Ok(DataStreamResponder::from(response))
+    Ok(CacheResponder::new(
+        DataStreamResponder::from(stream),
+        cache
+    ))
 }
 
 #[launch]
