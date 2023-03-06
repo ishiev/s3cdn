@@ -12,7 +12,7 @@ use rocket::{
     }, 
     State,
     http::Status,
-    Request,
+    Request, request::{FromRequest, Outcome},
 };
 use s3::{
     Bucket,
@@ -32,6 +32,8 @@ use crate::{
 
 #[derive(Responder)]
 enum Error {
+    #[response(status = 304)]
+    NotModified(String),
     #[response(status = 404)]
     NotFound(String),
     #[response(status = 403)]
@@ -45,6 +47,7 @@ enum Error {
 impl From<S3Error> for Error {
     fn from(e: S3Error) -> Self {
         match e {
+            S3Error::Http(304, e)   => Error::NotModified(e),
             S3Error::Http(404, _)   => Error::NotFound(e.to_string()),
             S3Error::Http(403, _)   => Error::Forbidden(e.to_string()),
             S3Error::Credentials(_) => Error::Forbidden(e.to_string()),
@@ -61,10 +64,44 @@ fn default_catcher(status: Status, _: &Request) -> String {
     format!("{}", status)
 }
 
+struct ConditionalHeaders<'r> {
+    if_modified_since: Option<&'r str>,
+    if_none_match: Option<&'r str>
+}
+
+impl<'r> ConditionalHeaders<'r> {
+    const IF_MODIFIED_SINCE: &'static str = "if-modified-since";
+    const IF_NONE_MATCH: &'static str = "if-none-match";
+
+    fn get_if_modified_since(&self) -> Option<(&'static str, &'r str)> {
+        self.if_modified_since.map(|x| (Self::IF_MODIFIED_SINCE, x))
+    }
+
+    fn get_if_none_match(&self) -> Option<(&'static str, &'r str)> {
+        self.if_none_match.map(|x| (Self::IF_NONE_MATCH, x))
+    }
+}
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for ConditionalHeaders<'r> {
+    type Error = std::convert::Infallible;
+
+    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        Outcome::Success(
+            Self {
+                if_modified_since: req.headers().get_one(Self::IF_MODIFIED_SINCE),
+                if_none_match: req.headers().get_one(Self::IF_NONE_MATCH)
+            }
+        )
+    }
+}
+
+
 #[get("/<bucket_name>/<path..>")]
 async fn index<'r>(
     bucket_name: &str,
     path: PathBuf,
+    condition: ConditionalHeaders<'_>,
     config: &State<Config<'_>>,
     cache: &'r State<ObjectCache>,
 ) -> Result<CacheResponder<'r, 'static, DataStreamResponder>, Error> {
@@ -82,6 +119,13 @@ async fn index<'r>(
             bucket.set_path_style();
         } else {
             bucket.set_subdomain_style();
+        }
+        // set conditional request headers
+        if let Some((key, value)) = condition.get_if_modified_since() {
+            bucket.add_header(key, value)
+        }
+        if let Some((key, value)) = condition.get_if_none_match() {
+            bucket.add_header(key, value)
         }
         bucket
     };
