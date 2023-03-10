@@ -14,8 +14,10 @@ rocket = "0.5.0-rc.2"
 aws-region = { version = "0.25.1", features = ["serde"] }
 rust-s3 = { git = "https://github.com/ishiev/rust-s3.git" }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 url = { version = "2", features = ["serde"] }
 cacache = { version = "*", default-features = false, features = ["tokio-runtime"] }
+time = "0.3"
 
 [patch."https://github.com/ishiev/rust-s3.git"]
 rust-s3 = { path = "../rust-s3/s3" }

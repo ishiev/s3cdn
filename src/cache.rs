@@ -1,17 +1,27 @@
 use rocket::{
     http::Header,
     request::Request,
-    response::{Responder, Response, Result},
+    response::{Responder, Response, Result}, 
+    async_stream::try_stream, 
 };
+use s3::{request::DataStream, error::S3Error};
 use serde::{
     Deserialize, 
     Serialize,
 };
+use serde_json::json;
+use tokio::io::AsyncWriteExt;
 use std::{
-    path::PathBuf, 
+    path::{PathBuf, Path}, 
     marker::PhantomData,
 };
-use cacache;
+use time::{
+    format_description::well_known::Rfc2822,
+    OffsetDateTime,
+};
+use cacache::{
+    WriteOpts,
+};
 
 
 /// Cache mode
@@ -61,6 +71,18 @@ impl ConfigObjectCache {
     }
 }
 
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Metadata {
+    bucket: String,
+    key: String,
+    last_modified: OffsetDateTime,
+    last_access: OffsetDateTime,
+    etag: String,
+    size: usize,
+}
+
+
 #[derive(Debug)]
 pub struct ObjectCache {
     config: ConfigObjectCache,
@@ -75,6 +97,46 @@ impl From<ConfigObjectCache> for ObjectCache {
             headers,
         }
     }
+}
+
+fn save_stream<P: AsRef<Path>>(
+    path: P, 
+    input: DataStream,
+    meta: Metadata
+) -> DataStream 
+{
+    let cache = {
+        let mut cache = PathBuf::new();
+        cache.push(path);
+        cache
+    };
+    let stream = try_stream! {
+        // create writer for store stream in cache
+        let mut fd = WriteOpts::new()
+            .size(meta.size)
+            .metadata(json!{meta})
+            .open(cache, format!("{}/{}", meta.bucket, meta.key))
+            .await
+            .map_err(|e| S3Error::Http(500, e.to_string()))?;
+
+        // read values from stream
+        for await value in input {
+            if let Ok(ref value) = value {
+                // write value to cache file
+                fd.write_all(value)
+                    .await
+                    .map_err(|e| S3Error::Io(e))?;
+            }
+            // yield to stream
+            yield value?;
+        }
+        // check size and commit date in cache
+        fd.commit()
+            .await
+            .map_err(|e| S3Error::Http(500, e.to_string()))?;
+    };
+    // return back pinned stream
+    Box::pin(stream)   
 }
 
 
@@ -108,22 +170,69 @@ impl <'r, 'o: 'r, R: Responder<'r, 'o>> CacheResponder<'r, 'o, R> {
 
 #[cfg(test)]
 mod test {
+    use rocket::{http::hyper::body::Bytes, async_stream::stream};
+    use s3::request::StreamItem;
+    use tokio::io::AsyncReadExt;
+    use tokio_util::io::StreamReader;
     use super::*;
 
     #[tokio::test]
     async fn double_write_cache() {
-        let dir = String::from("./my-cache");
+        let dir = "./tests/my-cache1";
+        let key = "my key";
 
-        // Write some data!
-        cacache::write(&dir, "key", b"my-async-data").await.unwrap();
-        // Write some data!
-        cacache::write(&dir, "key", b"my-async-data2").await.unwrap();
+        // write some data
+        cacache::write(dir, key, b"my-async-data").await.unwrap();
+        // write some data
+        cacache::write(dir, key, b"my-async-data2").await.unwrap();
 
-        // Get the data back!
-        let data = cacache::read(&dir, "key").await.unwrap();
+        // get the data back
+        let data = cacache::read(dir, key).await.unwrap();
         assert_eq!(data, b"my-async-data2");
 
-        // Clean up the data!
-        cacache::clear(&dir).await.unwrap();
+        // clean up the data
+        cacache::clear(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_stream() {
+        let dir = "./tests/my-cache2";
+        let key = "my key";
+        let bucket = "bucket1";
+
+        let input = Box::pin(
+            stream! {
+                for i in (0..10) {
+                    let item: StreamItem = Ok(Bytes::from(format!("hello {}\n", i)));
+                    yield item
+                }
+            }
+        );
+
+        let meta = Metadata { 
+            bucket: bucket.to_string(), 
+            key: key.to_string(),
+            last_modified: OffsetDateTime::now_utc(),
+            last_access: OffsetDateTime::now_utc(), 
+            etag: "some-etag".to_string(), 
+            size: 80
+        };
+
+        let saved = save_stream(dir, input, meta);
+
+        // read to buffer
+        let data1 = {
+            let mut reader = StreamReader::new(saved);
+            let mut data = vec![];
+            reader.read_to_end(&mut data).await.unwrap();
+            data
+        };
+
+        // get the data back
+        let data2 = cacache::read(dir, format!("{}/{}", bucket, key)).await.unwrap();
+        assert_eq!(data1, data2);
+
+        // clean up the data
+        cacache::clear(dir).await.unwrap();
     }
 }
