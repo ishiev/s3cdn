@@ -1489,11 +1489,13 @@ name = "s3cdn"
 version = "0.1.1"
 dependencies = [
  "aws-region",
+ "bytes",
  "cacache",
  "rocket",
  "rust-s3",
  "serde",
  "serde_json",
+ "ssri",
  "time",
  "tokio",
  "tokio-util",

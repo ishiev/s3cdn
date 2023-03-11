@@ -1,3 +1,4 @@
+use bytes::BytesMut;
 use rocket::{
     http::Header,
     request::Request,
@@ -10,7 +11,7 @@ use serde::{
     Serialize,
 };
 use serde_json::json;
-use tokio::io::AsyncWriteExt;
+use ssri::Integrity;
 use std::{
     path::{PathBuf, Path}, 
     marker::PhantomData,
@@ -19,8 +20,10 @@ use time::{
     format_description::well_known::Rfc2822,
     OffsetDateTime,
 };
+use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use cacache::{
-    WriteOpts,
+    WriteOpts, 
+    Reader,
 };
 
 
@@ -72,18 +75,22 @@ impl ConfigObjectCache {
 }
 
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct Metadata {
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct ObjectMeta {
     bucket: String,
     key: String,
     last_modified: OffsetDateTime,
-    last_access: OffsetDateTime,
     etag: String,
     size: usize,
 }
 
+impl ObjectMeta {
+    fn cache_key(&self) -> String {
+        format!("{}/{}", self.bucket, self.key)
+    }
+}
 
-#[derive(Debug)]
+
 pub struct ObjectCache {
     config: ConfigObjectCache,
     headers: Headers,
@@ -102,9 +109,8 @@ impl From<ConfigObjectCache> for ObjectCache {
 fn save_stream<P: AsRef<Path>>(
     path: P, 
     input: DataStream,
-    meta: Metadata
-) -> DataStream 
-{
+    meta: ObjectMeta
+) -> DataStream {
     let cache = {
         let mut cache = PathBuf::new();
         cache.push(path);
@@ -115,11 +121,11 @@ fn save_stream<P: AsRef<Path>>(
         let mut fd = WriteOpts::new()
             .size(meta.size)
             .metadata(json!{meta})
-            .open(cache, format!("{}/{}", meta.bucket, meta.key))
+            .open(cache, meta.cache_key())
             .await
             .map_err(|e| S3Error::Http(500, e.to_string()))?;
 
-        // read values from stream
+        // read values from input
         for await value in input {
             if let Ok(ref value) = value {
                 // write value to cache file
@@ -135,10 +141,37 @@ fn save_stream<P: AsRef<Path>>(
             .await
             .map_err(|e| S3Error::Http(500, e.to_string()))?;
     };
-    // return back pinned stream
+    // return pinned stream
     Box::pin(stream)   
 }
 
+
+fn read_stream<P: AsRef<Path>>(
+    path: P, 
+    sri: Integrity
+) -> DataStream {
+    let cache = {
+        let mut cache = PathBuf::new();
+        cache.push(path);
+        cache
+    };
+    let stream = try_stream! {
+        // open cache for reading
+        let mut fd = Reader::open_hash(cache, sri)
+            .await
+            .map_err(|e| S3Error::Http(500, e.to_string()))?;
+        // read values from cache
+        let mut buf = BytesMut::with_capacity(4096);    
+        while fd.read_buf(&mut buf).await? > 0 {
+            let chunk = buf.split();
+            yield chunk.freeze();
+        }
+        // check stream integrity
+        fd.check().map_err(|e| S3Error::Http(500, e.to_string()))?;
+    };
+    // return pinned stream
+    Box::pin(stream)
+}
 
 pub struct CacheResponder<'r, 'o: 'r, R: Responder<'r, 'o>> {
     inner: R,
@@ -190,7 +223,7 @@ mod test {
         let data = cacache::read(dir, key).await.unwrap();
         assert_eq!(data, b"my-async-data2");
 
-        // clean up the data
+        // clean up the cache
         cacache::clear(dir).await.unwrap();
     }
 
@@ -200,6 +233,15 @@ mod test {
         let key = "my key";
         let bucket = "bucket1";
 
+        let meta1 = ObjectMeta { 
+            bucket: bucket.to_string(), 
+            key: key.to_string(),
+            last_modified: OffsetDateTime::now_utc(),
+            etag: "some-etag".to_string(), 
+            size: 80
+        };
+
+        // input stream
         let input = Box::pin(
             stream! {
                 for i in (0..10) {
@@ -209,18 +251,9 @@ mod test {
             }
         );
 
-        let meta = Metadata { 
-            bucket: bucket.to_string(), 
-            key: key.to_string(),
-            last_modified: OffsetDateTime::now_utc(),
-            last_access: OffsetDateTime::now_utc(), 
-            etag: "some-etag".to_string(), 
-            size: 80
-        };
-
-        let saved = save_stream(dir, input, meta);
-
-        // read to buffer
+        // save input to cache and return persisted stream
+        let saved = save_stream(dir, input, meta1.clone());
+        // read to buffer1
         let data1 = {
             let mut reader = StreamReader::new(saved);
             let mut data = vec![];
@@ -228,11 +261,26 @@ mod test {
             data
         };
 
-        // get the data back
-        let data2 = cacache::read(dir, format!("{}/{}", bucket, key)).await.unwrap();
+        // get stream from cache
+        let md = cacache::metadata(dir, meta1.cache_key()).await.unwrap().unwrap();
+        let sri = md.integrity;
+        let meta2: ObjectMeta = serde_json::from_value(md.metadata).unwrap();
+        let cached = read_stream(dir, sri);
+        // read to buffer2
+        let data2 = {
+            let mut reader = StreamReader::new(cached);
+            let mut data = vec![];
+            reader.read_to_end(&mut data).await.unwrap();
+            data
+        };
+
+        // compare buffers
         assert_eq!(data1, data2);
 
-        // clean up the data
+        // compare metas
+        assert_eq!(meta1, meta2);
+
+        // clean up the cache
         cacache::clear(dir).await.unwrap();
     }
 }
