@@ -209,6 +209,18 @@ mod test {
     use tokio_util::io::StreamReader;
     use super::*;
 
+    async fn pause() {
+        let mut stdin = tokio::io::stdin();
+        let mut stdout = tokio::io::stdout();
+    
+        // we want the cursor to stay at the end of the line, so we print without a newline and flush manually.
+        stdout.write_all(b"Press Enter to continue...").await.unwrap();
+        stdout.flush().await.unwrap();
+    
+        // wead a single byte and discard
+        let _ = stdin.read(&mut [0u8]).await.unwrap();
+    }
+
     #[tokio::test]
     async fn double_write_cache() {
         let dir = "./tests/my-cache1";
@@ -260,6 +272,10 @@ mod test {
             reader.read_to_end(&mut data).await.unwrap();
             data
         };
+
+        // uncomment to pause to manually edit the cache file and cause the integrity check to fail
+        // press Enter in terminal to continue
+        //pause().await;
 
         // get stream from cache
         let md = cacache::metadata(dir, meta1.cache_key()).await.unwrap().unwrap();
