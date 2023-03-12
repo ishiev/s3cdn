@@ -2,11 +2,14 @@
 address = "127.0.0.1"
 port = 8000
 base_path = "/"
-log_level = "normal"
 
-[default.storage]
-root = "data"
+[default.cache]
+mode = "External"
+use_stale = 3600
+
+[default.connection]
+endpoint = "https://some_service.io"
 
 [default.creds]
-access_key = "minioadmin"
-secret_key = "minioadmin"
+access_key = "some_key"
+secret_key = "some_secret"

@@ -144,6 +144,7 @@ fn rocket() -> _ {
     let figment = Figment::from(rocket::Config::default())
         .merge(Serialized::defaults(Config::default()))
         .merge(Toml::file("s3cdn.toml").nested())
+        .merge(Toml::file("s3cdn-dev.toml").nested())
         .merge(Env::prefixed("S3CDN").global())
         .select(Profile::from_env_or("S3CDN_PROFILE", "default"));
 
