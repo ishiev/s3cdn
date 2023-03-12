@@ -1,6 +1,6 @@
 use bytes::BytesMut;
 use rocket::{
-    http::Header,
+    http::{Header, HeaderMap},
     request::Request,
     response::{Responder, Response, Result}, 
     async_stream::try_stream, 
@@ -36,9 +36,6 @@ pub enum CacheMode {
     Internal            // by this module
 }
 
-/// Cache response headers 
-type Headers = Vec<Header<'static>>;
-
 /// Cache params
 #[derive(Default, Debug, Deserialize, Serialize)]
 pub struct ConfigObjectCache {
@@ -52,7 +49,9 @@ pub struct ConfigObjectCache {
 }
 
 impl ConfigObjectCache {
-    fn make_headers(&self) -> Headers {
+    fn make_headers(&self) -> HeaderMap<'static> {
+        let mut map = HeaderMap::new();
+        // add cache-control header for external mode
         if self.mode == CacheMode::External {
             // default 10 sec fresh
             let max_age = self.max_age.unwrap_or(10); 
@@ -65,35 +64,62 @@ impl ConfigObjectCache {
                 // not use stale resource, must revalidate or return error
                 String::from(", must-revalidate")
             };
-            vec![
-                Header::new("cache-control", format!("max-age={max_age}{stale_directive}"))
-            ]
-        } else {
-            vec![]
+            map.add(Header::new(
+                "cache-control", 
+                format!("max-age={max_age}{stale_directive}")
+            ))
         }
+        map
     }
 }
 
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ObjectMeta {
     bucket: String,
     key: String,
-    last_modified: OffsetDateTime,
-    etag: String,
-    size: usize,
+    content_length: Option<usize>,
+    content_type: Option<String>,
+    last_modified: Option<OffsetDateTime>,
+    etag: Option<String>,
 }
 
 impl ObjectMeta {
+    const CONTENT_LENGTH: &'static str = "content-length";    
+    const CONTENT_TYPE: &'static str = "content-type";
+    const LAST_MODIFIED: &'static str = "last-modified";
+    const ETAG: &'static str = "etag";
+
+    fn new<S: AsRef<str>>(bucket: S, key: S, headers: &HeaderMap) -> Self {
+        // read content length header
+        let content_length = headers.get_one(Self::CONTENT_LENGTH)
+            .and_then(|s| s.parse::<usize>().ok());     
+        // read content-type header
+        let content_type = headers.get_one(Self::CONTENT_TYPE).map(String::from);
+        // read & parse last-modified header
+        let last_modified = headers.get_one(Self::LAST_MODIFIED)
+            .and_then(|t| OffsetDateTime::parse(t, &Rfc2822).ok());
+        // read etag header
+        let etag = headers.get_one(Self::ETAG).map(String::from);
+
+        Self {
+            bucket: String::from(bucket.as_ref()),
+            key: String::from(key.as_ref()),
+            content_length,
+            content_type,
+            last_modified,
+            etag,
+        }
+    }
+
     fn cache_key(&self) -> String {
         format!("{}/{}", self.bucket, self.key)
     }
 }
 
-
 pub struct ObjectCache {
     config: ConfigObjectCache,
-    headers: Headers,
+    headers: HeaderMap<'static>,
 }
 
 impl From<ConfigObjectCache> for ObjectCache {
@@ -118,12 +144,18 @@ fn save_stream<P: AsRef<Path>>(
     };
     let stream = try_stream! {
         // create writer for store stream in cache
-        let mut fd = WriteOpts::new()
-            .size(meta.size)
+        let mut fd = {
+            let opts = WriteOpts::new();
+            if let Some(size) = meta.content_length  {
+                opts.size(size)
+            } else {
+                opts
+            }
             .metadata(json!{meta})
             .open(cache, meta.cache_key())
             .await
-            .map_err(|e| S3Error::Http(500, e.to_string()))?;
+            .map_err(|e| S3Error::Http(500, e.to_string()))?
+        };
 
         // read values from input
         for await value in input {
@@ -161,7 +193,7 @@ fn read_stream<P: AsRef<Path>>(
             .await
             .map_err(|e| S3Error::Http(500, e.to_string()))?;
         // read values from cache
-        let mut buf = BytesMut::with_capacity(4096);    
+        let mut buf = BytesMut::with_capacity(rocket::response::Body::DEFAULT_MAX_CHUNK);    
         while fd.read_buf(&mut buf).await? > 0 {
             let chunk = buf.split();
             yield chunk.freeze();
@@ -183,8 +215,8 @@ pub struct CacheResponder<'r, 'o: 'r, R: Responder<'r, 'o>> {
 impl<'r, 'o: 'r, R: Responder<'r, 'o>> Responder<'r, 'o> for CacheResponder<'r, 'o, R> {
     fn respond_to(self, req: &'r Request<'_>) -> Result<'o> {
         let mut res = Response::build_from(self.inner.respond_to(req)?);
-        for h in self.cache.headers.iter() {
-            res.header(h.to_owned());
+        for h in self.cache.headers.to_owned().into_iter() {
+            res.header(h);
         }
         res.ok()
     }
@@ -203,7 +235,11 @@ impl <'r, 'o: 'r, R: Responder<'r, 'o>> CacheResponder<'r, 'o, R> {
 
 #[cfg(test)]
 mod test {
-    use rocket::{http::hyper::body::Bytes, async_stream::stream};
+    use bytes::Bytes;
+    use rocket::{
+        http::ContentType, 
+        async_stream::stream
+    };
     use s3::request::StreamItem;
     use tokio::io::AsyncReadExt;
     use tokio_util::io::StreamReader;
@@ -217,7 +253,7 @@ mod test {
         stdout.write_all(b"Press Enter to continue...").await.unwrap();
         stdout.flush().await.unwrap();
     
-        // wead a single byte and discard
+        // read a single byte and discard
         let _ = stdin.read(&mut [0u8]).await.unwrap();
     }
 
@@ -248,9 +284,10 @@ mod test {
         let meta1 = ObjectMeta { 
             bucket: bucket.to_string(), 
             key: key.to_string(),
-            last_modified: OffsetDateTime::now_utc(),
-            etag: "some-etag".to_string(), 
-            size: 80
+            content_type: Some(ContentType::HTML.to_string()), 
+            content_length: Some(80),
+            last_modified: Some(OffsetDateTime::now_utc()),
+            etag: Some("some-etag".to_string()), 
         };
 
         // input stream
