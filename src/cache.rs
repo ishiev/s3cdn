@@ -113,9 +113,8 @@ impl ObjectMeta {
             map.add_raw(Self::CONTENT_TYPE, value);
         }
         if let Some(value) = self.last_modified {
-            if let time = HttpDate::from(value) {
-                map.add_raw(Self::LAST_MODIFIED, time.to_string());
-            }
+            let time = HttpDate::from(value);
+            map.add_raw(Self::LAST_MODIFIED, time.to_string());
         }
         if let Some(ref value) = self.etag {
             map.add_raw(Self::ETAG, value);
