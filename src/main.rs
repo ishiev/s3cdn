@@ -11,7 +11,7 @@ use rocket::{
         Figment, Profile,
     }, 
     State,
-    http::Status,
+    http::{Status, HeaderMap},
     Request, request::{FromRequest, Outcome},
 };
 use s3::{
@@ -73,12 +73,15 @@ impl<'r> ConditionalHeaders<'r> {
     const IF_MODIFIED_SINCE: &'static str = "if-modified-since";
     const IF_NONE_MATCH: &'static str = "if-none-match";
 
-    fn get_if_modified_since(&self) -> Option<(&'static str, &'r str)> {
-        self.if_modified_since.map(|x| (Self::IF_MODIFIED_SINCE, x))
-    }
-
-    fn get_if_none_match(&self) -> Option<(&'static str, &'r str)> {
-        self.if_none_match.map(|x| (Self::IF_NONE_MATCH, x))
+    fn headers(&self) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        if let Some(value) = self.if_modified_since {
+            map.add_raw(Self::IF_MODIFIED_SINCE, value);
+        }
+        if let Some(value) = self.if_none_match {
+            map.add_raw(Self::IF_NONE_MATCH, value);
+        }
+        map
     }
 }
 
@@ -121,11 +124,8 @@ async fn index<'r>(
             bucket.set_subdomain_style();
         }
         // set conditional request headers
-        if let Some((key, value)) = condition.get_if_modified_since() {
-            bucket.add_header(key, value)
-        }
-        if let Some((key, value)) = condition.get_if_none_match() {
-            bucket.add_header(key, value)
+        for h in condition.headers().into_iter() {
+            bucket.add_header(h.name().as_str(), h.value());
         }
         bucket
     };
