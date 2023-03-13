@@ -1,4 +1,5 @@
 use bytes::BytesMut;
+use httpdate::HttpDate;
 use rocket::{
     http::{Header, HeaderMap},
     request::Request,
@@ -14,11 +15,9 @@ use serde_json::json;
 use ssri::Integrity;
 use std::{
     path::{PathBuf, Path}, 
-    marker::PhantomData,
-};
-use time::{
-    format_description::well_known::Rfc2822,
-    OffsetDateTime,
+    marker::PhantomData, 
+    str::FromStr,
+    time::SystemTime, 
 };
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use cacache::{
@@ -73,14 +72,29 @@ impl ConfigObjectCache {
     }
 }
 
+#[derive(Default, Debug, Copy, Clone)]
+pub struct ObjectKey<'r> {
+    bucket: &'r str,
+    key: &'r str,
+}
+
+impl ObjectKey<'_> {
+    fn cache_key(&self) -> String {
+        format!("{}/{}", self.bucket, self.key)
+    }
+}
+
+impl<'a> AsRef<ObjectKey<'a>> for ObjectKey<'a> {
+    fn as_ref(&self) -> &Self { 
+        self
+    }
+}
 
 #[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ObjectMeta {
-    bucket: String,
-    key: String,
     content_length: Option<usize>,
     content_type: Option<String>,
-    last_modified: Option<OffsetDateTime>,
+    last_modified: Option<SystemTime>,
     etag: Option<String>,
 }
 
@@ -90,7 +104,28 @@ impl ObjectMeta {
     const LAST_MODIFIED: &'static str = "last-modified";
     const ETAG: &'static str = "etag";
 
-    fn new<S: AsRef<str>>(bucket: S, key: S, headers: &HeaderMap) -> Self {
+    fn headers(&self) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        if let Some(value) = self.content_length {
+            map.add_raw(Self::CONTENT_LENGTH, value.to_string());
+        }
+        if let Some(ref value) = self.content_type {
+            map.add_raw(Self::CONTENT_TYPE, value);
+        }
+        if let Some(value) = self.last_modified {
+            if let time = HttpDate::from(value) {
+                map.add_raw(Self::LAST_MODIFIED, time.to_string());
+            }
+        }
+        if let Some(ref value) = self.etag {
+            map.add_raw(Self::ETAG, value);
+        }
+        map
+    }
+}
+
+impl From<&HeaderMap<'_>> for ObjectMeta {
+    fn from(headers: &HeaderMap) -> Self {
         // read content length header
         let content_length = headers.get_one(Self::CONTENT_LENGTH)
             .and_then(|s| s.parse::<usize>().ok());     
@@ -98,23 +133,17 @@ impl ObjectMeta {
         let content_type = headers.get_one(Self::CONTENT_TYPE).map(String::from);
         // read & parse last-modified header
         let last_modified = headers.get_one(Self::LAST_MODIFIED)
-            .and_then(|t| OffsetDateTime::parse(t, &Rfc2822).ok());
+            .and_then(|t| HttpDate::from_str(t).ok().map(|x| x.into()));
         // read etag header
         let etag = headers.get_one(Self::ETAG).map(String::from);
 
         Self {
-            bucket: String::from(bucket.as_ref()),
-            key: String::from(key.as_ref()),
             content_length,
             content_type,
             last_modified,
             etag,
         }
-    }
-
-    fn cache_key(&self) -> String {
-        format!("{}/{}", self.bucket, self.key)
-    }
+    } 
 }
 
 pub struct ObjectCache {
@@ -132,8 +161,9 @@ impl From<ConfigObjectCache> for ObjectCache {
     }
 }
 
-fn save_stream<P: AsRef<Path>>(
-    path: P, 
+fn save_stream<'a, P: AsRef<Path>, K: AsRef<ObjectKey<'a>>>(
+    path: P,
+    key: K,
     input: DataStream,
     meta: ObjectMeta
 ) -> DataStream {
@@ -142,17 +172,19 @@ fn save_stream<P: AsRef<Path>>(
         cache.push(path);
         cache
     };
+    let key = key.as_ref().cache_key();
     let stream = try_stream! {
         // create writer for store stream in cache
         let mut fd = {
             let opts = WriteOpts::new();
+            // add size info to check integrity on commit
             if let Some(size) = meta.content_length  {
                 opts.size(size)
             } else {
                 opts
             }
             .metadata(json!{meta})
-            .open(cache, meta.cache_key())
+            .open(cache, key)
             .await
             .map_err(|e| S3Error::Http(500, e.to_string()))?
         };
@@ -278,15 +310,15 @@ mod test {
     #[tokio::test]
     async fn cache_stream() {
         let dir = "./tests/my-cache2";
-        let key = "my key";
-        let bucket = "bucket1";
+        let key = ObjectKey {
+            bucket: "bucket1",
+            key: "my key"
+        };
 
         let meta1 = ObjectMeta { 
-            bucket: bucket.to_string(), 
-            key: key.to_string(),
             content_type: Some(ContentType::HTML.to_string()), 
             content_length: Some(80),
-            last_modified: Some(OffsetDateTime::now_utc()),
+            last_modified: Some(SystemTime::now()),
             etag: Some("some-etag".to_string()), 
         };
 
@@ -301,7 +333,7 @@ mod test {
         );
 
         // save input to cache and return persisted stream
-        let saved = save_stream(dir, input, meta1.clone());
+        let saved = save_stream(dir, key, input, meta1.clone());
         // read to buffer1
         let data1 = {
             let mut reader = StreamReader::new(saved);
@@ -315,7 +347,7 @@ mod test {
         //pause().await;
 
         // get stream from cache
-        let md = cacache::metadata(dir, meta1.cache_key()).await.unwrap().unwrap();
+        let md = cacache::metadata(dir, key.cache_key()).await.unwrap().unwrap();
         let sri = md.integrity;
         let meta2: ObjectMeta = serde_json::from_value(md.metadata).unwrap();
         let cached = read_stream(dir, sri);
@@ -335,5 +367,18 @@ mod test {
 
         // clean up the cache
         cacache::clear(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn object_meta_headers() {
+        let mut headers = HeaderMap::new();
+        headers.add_raw("content-length", "12096836");
+        headers.add_raw("content-type", "image/jpeg");
+        headers.add_raw("last-modified", "Fri, 10 Feb 2023 09:57:33 GMT");
+        headers.add_raw("etag", "76febaf5c48e1e2c834c6663d0cbedcb");
+
+        let meta = ObjectMeta::from(&headers);
+
+        assert_eq!(headers, meta.headers());
     }
 }

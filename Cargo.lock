@@ -1491,6 +1491,7 @@ dependencies = [
  "aws-region",
  "bytes",
  "cacache",
+ "httpdate",
  "rocket",
  "rust-s3",
  "serde",
