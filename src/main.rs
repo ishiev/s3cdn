@@ -25,8 +25,11 @@ mod cache;
 
 use crate::{
     config::Config,
-    responder::DataStreamResponder,
-    cache::{ObjectCache, CacheResponder},
+    responder::{
+        DataStreamResponder,
+        CacheResponder,
+    },
+    cache::{ObjectCache},
 };
 
 

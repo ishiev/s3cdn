@@ -1,12 +1,13 @@
 use bytes::BytesMut;
 use httpdate::HttpDate;
 use rocket::{
-    http::{Header, HeaderMap},
-    request::Request,
-    response::{Responder, Response, Result}, 
+    http::{Header, HeaderMap}, 
     async_stream::try_stream, 
 };
-use s3::{request::DataStream, error::S3Error};
+use s3::{
+    request::DataStream, 
+    error::S3Error
+};
 use serde::{
     Deserialize, 
     Serialize,
@@ -15,9 +16,9 @@ use serde_json::json;
 use ssri::Integrity;
 use std::{
     path::{PathBuf, Path}, 
-    marker::PhantomData, 
     str::FromStr,
     time::SystemTime, 
+    collections::HashMap, 
 };
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use cacache::{
@@ -94,6 +95,7 @@ impl<'a> AsRef<ObjectKey<'a>> for ObjectKey<'a> {
 pub struct ObjectMeta {
     content_length: Option<usize>,
     content_type: Option<String>,
+    date: Option<SystemTime>,
     last_modified: Option<SystemTime>,
     etag: Option<String>,
 }
@@ -101,23 +103,28 @@ pub struct ObjectMeta {
 impl ObjectMeta {
     const CONTENT_LENGTH: &'static str = "content-length";    
     const CONTENT_TYPE: &'static str = "content-type";
+    const DATE: &'static str = "date";
     const LAST_MODIFIED: &'static str = "last-modified";
     const ETAG: &'static str = "etag";
 
-    fn headers(&self) -> HeaderMap {
+    pub fn headers(&self) -> HeaderMap<'static> {
         let mut map = HeaderMap::new();
         if let Some(value) = self.content_length {
             map.add_raw(Self::CONTENT_LENGTH, value.to_string());
         }
         if let Some(ref value) = self.content_type {
-            map.add_raw(Self::CONTENT_TYPE, value);
+            map.add_raw(Self::CONTENT_TYPE, value.to_string());
+        }
+        if let Some(value) = self.date {
+            let time = HttpDate::from(value);
+            map.add_raw(Self::DATE, time.to_string());
         }
         if let Some(value) = self.last_modified {
             let time = HttpDate::from(value);
             map.add_raw(Self::LAST_MODIFIED, time.to_string());
         }
         if let Some(ref value) = self.etag {
-            map.add_raw(Self::ETAG, value);
+            map.add_raw(Self::ETAG, value.to_string());
         }
         map
     }
@@ -130,6 +137,9 @@ impl From<&HeaderMap<'_>> for ObjectMeta {
             .and_then(|s| s.parse::<usize>().ok());     
         // read content-type header
         let content_type = headers.get_one(Self::CONTENT_TYPE).map(String::from);
+        // read & parse date header
+        let date = headers.get_one(Self::DATE)
+            .and_then(|t| HttpDate::from_str(t).ok().map(|x| x.into()));
         // read & parse last-modified header
         let last_modified = headers.get_one(Self::LAST_MODIFIED)
             .and_then(|t| HttpDate::from_str(t).ok().map(|x| x.into()));
@@ -139,10 +149,22 @@ impl From<&HeaderMap<'_>> for ObjectMeta {
         Self {
             content_length,
             content_type,
+            date,
             last_modified,
             etag,
         }
     } 
+}
+
+impl From<&HashMap<String, String>> for ObjectMeta {
+    
+    fn from(headers: &HashMap<String, String>) -> Self {
+        let mut map = HeaderMap::new();
+        for (name, value) in headers {
+            map.add_raw(name, value)
+        }
+        Self::from(&map)
+    }
 }
 
 pub struct ObjectCache {
@@ -157,6 +179,12 @@ impl From<ConfigObjectCache> for ObjectCache {
             config,
             headers,
         }
+    }
+}
+
+impl ObjectCache {
+    pub fn headers(&self) -> HeaderMap<'static> {
+        self.headers.to_owned()
     }
 }
 
@@ -236,34 +264,6 @@ fn read_stream<P: AsRef<Path>>(
     Box::pin(stream)
 }
 
-pub struct CacheResponder<'r, 'o: 'r, R: Responder<'r, 'o>> {
-    inner: R,
-    cache: &'r ObjectCache,
-    #[doc(hidden)]
-    _phantom: PhantomData<(&'r R, &'o R)>,
-}
-
-impl<'r, 'o: 'r, R: Responder<'r, 'o>> Responder<'r, 'o> for CacheResponder<'r, 'o, R> {
-    fn respond_to(self, req: &'r Request<'_>) -> Result<'o> {
-        let mut res = Response::build_from(self.inner.respond_to(req)?);
-        for h in self.cache.headers.to_owned().into_iter() {
-            res.header(h);
-        }
-        res.ok()
-    }
-}
-
-impl <'r, 'o: 'r, R: Responder<'r, 'o>> CacheResponder<'r, 'o, R> {
-    pub fn new(inner: R, cache: &'r ObjectCache) -> Self {
-        Self {
-            inner,
-            cache,
-            _phantom: PhantomData
-        }
-    }
-}
-
-
 #[cfg(test)]
 mod test {
     use bytes::Bytes;
@@ -317,6 +317,7 @@ mod test {
         let meta1 = ObjectMeta { 
             content_type: Some(ContentType::HTML.to_string()), 
             content_length: Some(80),
+            date: Some(SystemTime::now()),
             last_modified: Some(SystemTime::now()),
             etag: Some("some-etag".to_string()), 
         };
@@ -373,6 +374,7 @@ mod test {
         let mut headers = HeaderMap::new();
         headers.add_raw("content-length", "12096836");
         headers.add_raw("content-type", "image/jpeg");
+        headers.add_raw("date", HttpDate::from(SystemTime::now()).to_string());
         headers.add_raw("last-modified", "Fri, 10 Feb 2023 09:57:33 GMT");
         headers.add_raw("etag", "76febaf5c48e1e2c834c6663d0cbedcb");
 
