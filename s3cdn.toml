@@ -4,7 +4,8 @@ port = 8000
 base_path = "/"
 
 [default.cache]
-mode = "External"
+mode = "Internal"
+root = "data"
 use_stale = 3600
 
 [default.connection]

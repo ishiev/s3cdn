@@ -25,11 +25,8 @@ mod cache;
 
 use crate::{
     config::Config,
-    responder::{
-        DataStreamResponder,
-        CacheResponder,
-    },
-    cache::{ObjectCache},
+    responder::CacheResponder,
+    cache::{DataObject, ObjectKey, ObjectCache},
 };
 
 
@@ -105,12 +102,12 @@ impl<'r> FromRequest<'r> for ConditionalHeaders<'r> {
 
 #[get("/<bucket_name>/<path..>")]
 async fn index<'r>(
-    bucket_name: &str,
+    bucket_name: &'r str,
     path: PathBuf,
     condition: ConditionalHeaders<'_>,
     config: &State<Config<'_>>,
     cache: &'r State<ObjectCache>,
-) -> Result<CacheResponder<'r, 'static, DataStreamResponder>, Error> {
+) -> Result<CacheResponder<'r, 'static, DataObject>, Error> {
     // configure S3 Bucket
     let bucket = {
         let mut bucket = Bucket::new(
@@ -133,10 +130,18 @@ async fn index<'r>(
         bucket
     };
 
-    let stream = bucket.get_object_stream(path.to_string_lossy()).await?;
+    let key = ObjectKey {
+        bucket: bucket_name,
+        key: &path,
+    };
+    // origin source closure
+    let origin = || async {
+        Ok(DataObject::from(bucket.get_object_stream(path.to_string_lossy()).await?))
+    };
+    let object = cache.get_object(key, origin).await?;
 
     Ok(CacheResponder::new(
-        DataStreamResponder::from(stream),
+        object,
         cache
     ))
 }

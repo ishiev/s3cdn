@@ -19,6 +19,7 @@ use std::{
     str::FromStr,
     time::SystemTime, 
     collections::HashMap, 
+    future::Future, 
 };
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use cacache::{
@@ -28,7 +29,7 @@ use cacache::{
 
 
 /// Cache mode
-#[derive(Default, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Default, Debug, Deserialize, Serialize, PartialEq, Clone, Copy)]
 pub enum CacheMode {
     Off,                // cache is inactive
     #[default]
@@ -73,15 +74,15 @@ impl ConfigObjectCache {
     }
 }
 
-#[derive(Default, Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub struct ObjectKey<'r> {
-    bucket: &'r str,
-    key: &'r str,
+    pub bucket: &'r str,
+    pub key: &'r Path,
 }
 
 impl ObjectKey<'_> {
     fn cache_key(&self) -> String {
-        format!("{}/{}", self.bucket, self.key)
+        format!("{}/{}", self.bucket, self.key.to_string_lossy())
     }
 }
 
@@ -167,6 +168,11 @@ impl From<&HashMap<String, String>> for ObjectMeta {
     }
 }
 
+pub struct DataObject {
+    pub meta: ObjectMeta,
+    pub stream: DataStream
+}
+
 pub struct ObjectCache {
     config: ConfigObjectCache,
     headers: HeaderMap<'static>,
@@ -183,8 +189,77 @@ impl From<ConfigObjectCache> for ObjectCache {
 }
 
 impl ObjectCache {
+    /// Get cache-control headers for response
     pub fn headers(&self) -> HeaderMap<'static> {
         self.headers.to_owned()
+    }
+
+    pub fn mode(&self) -> CacheMode {
+        self.config.mode
+    }
+
+    /// Get object from cache or from origin source, bypass if mode != Internal
+    pub async fn get_object<'a, K, F, Fut>(&self, key: K, origin: F)
+    -> Result<DataObject, S3Error> 
+    where 
+        K: AsRef<ObjectKey<'a>> + std::marker::Copy,
+        F: FnOnce()->Fut,
+        Fut: Future<Output = Result<DataObject, S3Error>>
+    {
+        if self.mode() == CacheMode::Internal {
+            self.get_cached_object(key, origin).await
+        } else {
+            origin().await
+        }
+    }
+
+    /// Get object from cache or from origin source
+    pub async fn get_cached_object<'a, K, F, Fut>(&self, key: K, origin: F) 
+    -> Result<DataObject, S3Error> 
+    where 
+        K: AsRef<ObjectKey<'a>> + std::marker::Copy,
+        F: FnOnce()->Fut,
+        Fut: Future<Output = Result<DataObject, S3Error>>
+    {
+        let cache = self.config.root
+            .as_ref()
+            .ok_or(S3Error::Http(500, "Cache root config param not defined".to_string()))?;
+        // try to get object from cache
+        // check key in cache metadata
+        let try_obj = if let Some(md) = cacache::metadata(cache, key.as_ref().cache_key())
+            .await
+            .map_err(|e| S3Error::Http(500, e.to_string()))? {
+            // check data in cache
+            let sri = md.integrity;
+            if cacache::exists(cache, &sri).await {
+                // decode meta from json
+                let meta: ObjectMeta = serde_json::from_value(md.metadata)
+                    .map_err(|e| S3Error::Http(500, e.to_string()))?;
+                // get stream from cache
+                let stream = read_stream(cache, sri);
+                Some(DataObject {
+                    meta,
+                    stream
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        // return obj from cache or from origin
+        if let Some(obj) = try_obj {
+            Ok(obj)
+        } else {
+            // get object from origin source function
+            let obj = origin().await?;
+            // save to cache
+            let stream = save_stream(cache, key, obj.stream, obj.meta.to_owned());
+            Ok(DataObject {
+                meta: obj.meta,
+                stream
+            })
+        }
     }
 }
 
@@ -257,8 +332,6 @@ fn read_stream<P: AsRef<Path>>(
             let chunk = buf.split();
             yield chunk.freeze();
         }
-        // check stream integrity
-        fd.check().map_err(|e| S3Error::Http(500, e.to_string()))?;
     };
     // return pinned stream
     Box::pin(stream)
@@ -276,6 +349,7 @@ mod test {
     use tokio_util::io::StreamReader;
     use super::*;
 
+    #[allow(dead_code)]
     async fn pause() {
         let mut stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
@@ -311,7 +385,7 @@ mod test {
         let dir = "./tests/my-cache2";
         let key = ObjectKey {
             bucket: "bucket1",
-            key: "my key"
+            key: Path::new("my key")
         };
 
         let meta1 = ObjectMeta { 

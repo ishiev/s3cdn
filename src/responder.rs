@@ -9,26 +9,25 @@ use tokio_util::io::StreamReader;
 
 use crate::cache::{
     ObjectCache, 
-    ObjectMeta
+    ObjectMeta,
+    DataObject
 };
 
-pub struct DataStreamResponder {
-    inner: ResponseDataStream, 
-}
-
-impl From<ResponseDataStream> for DataStreamResponder {
+impl From<ResponseDataStream> for DataObject {
     fn from(s: ResponseDataStream) -> Self {
-        DataStreamResponder { inner: s }
+        DataObject { 
+            meta: ObjectMeta::from(&s.headers),
+            stream: s.bytes
+        }
     }
 }
 
-impl<'r> Responder<'r, 'static> for DataStreamResponder {
+impl<'r> Responder<'r, 'static> for DataObject {
     fn respond_to(self, _: &'r Request<'_>) -> Result<'static> {
-        let reader = StreamReader::new(self.inner.bytes);
+        let reader = StreamReader::new(self.stream);
         let mut builder = Response::build();
         // add nessesary headers
-        let meta = ObjectMeta::from(&self.inner.headers);
-        for h in meta.headers().into_iter() {
+        for h in self.meta.headers().into_iter() {
             builder.header(h);
         }
         builder
