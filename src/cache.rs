@@ -20,6 +20,7 @@ use std::{
     time::SystemTime, 
     collections::HashMap, 
     future::Future, 
+    borrow::Cow, 
 };
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use cacache::{
@@ -168,11 +169,79 @@ impl From<&HashMap<String, String>> for ObjectMeta {
     }
 }
 
+// Values from conditional request
+pub struct ConditionalHeaders<'r> {
+    if_modified_since: Option<Cow<'r, str>>,
+    if_none_match: Option<Cow<'r, str>>
+}
+
+impl<'r> ConditionalHeaders<'r> {
+    const IF_MODIFIED_SINCE: &'static str = "if-modified-since";
+    const IF_NONE_MATCH: &'static str = "if-none-match";
+
+    pub fn headers(self) -> HeaderMap<'r> {
+        let mut map = HeaderMap::new();
+        if let Some(value) = self.if_modified_since {
+            map.add_raw(Self::IF_MODIFIED_SINCE, value);
+        }
+        if let Some(value) = self.if_none_match {
+            map.add_raw(Self::IF_NONE_MATCH, value);
+        }
+        map
+    }
+}
+
+/// Construct from object meta
+impl <'r> From<&'r ObjectMeta> for ConditionalHeaders<'r> {
+    fn from(value: &'r ObjectMeta) -> Self {
+        let if_modified_since = value.last_modified
+            .map(|x| HttpDate::from(x).to_string().into());
+        let if_none_match = value.etag
+            .as_ref()
+            .map(Cow::from);
+        Self {
+            if_modified_since,
+            if_none_match
+        }
+    }
+}
+
+/// Construst from headers
+impl <'r> From<&'r HeaderMap<'r>> for ConditionalHeaders<'r> {
+    fn from(headers: &'r HeaderMap<'_>) -> Self {
+        Self {
+            if_modified_since: headers.get_one(Self::IF_MODIFIED_SINCE).map(Cow::from),
+            if_none_match: headers.get_one(Self::IF_NONE_MATCH).map(Cow::from)
+        }
+    }
+}
+
+/// Cached data object 
 pub struct DataObject {
     pub meta: ObjectMeta,
     pub stream: DataStream
 }
 
+/// Variants for cache object revalidation
+enum ValidationResult {
+    NotModified,
+    Modified(DataObject),
+    NotFound,
+    Err(S3Error)
+}
+
+impl From<Result<DataObject, S3Error>> for ValidationResult {
+    fn from(value: Result<DataObject, S3Error>) -> Self {
+        match value {
+            Ok(object) => Self::Modified(object),
+            Err(S3Error::Http(304, _)) => Self::NotModified,
+            Err(S3Error::Http(404, _)) => Self::NotFound,
+            Err(e) => Self::Err(e),
+        }
+    }
+}
+
+/// Object cache
 pub struct ObjectCache {
     config: ConfigObjectCache,
     headers: HeaderMap<'static>,
@@ -203,13 +272,13 @@ impl ObjectCache {
     -> Result<DataObject, S3Error> 
     where 
         K: AsRef<ObjectKey<'a>> + std::marker::Copy,
-        F: FnOnce()->Fut,
+        F: FnOnce(Option<ConditionalHeaders <'a>>)->Fut,
         Fut: Future<Output = Result<DataObject, S3Error>>
     {
         if self.mode() == CacheMode::Internal {
             self.get_cached_object(key, origin).await
         } else {
-            origin().await
+            origin(None).await
         }
     }
 
@@ -218,7 +287,7 @@ impl ObjectCache {
     -> Result<DataObject, S3Error> 
     where 
         K: AsRef<ObjectKey<'a>> + std::marker::Copy,
-        F: FnOnce()->Fut,
+        F: FnOnce(Option<ConditionalHeaders<'a>>)->Fut,
         Fut: Future<Output = Result<DataObject, S3Error>>
     {
         let cache = self.config.root
@@ -252,7 +321,7 @@ impl ObjectCache {
             Ok(obj)
         } else {
             // get object from origin source function
-            let obj = origin().await?;
+            let obj = origin(None).await?;
             // save to cache
             let stream = save_stream(cache, key, obj.stream, obj.meta.to_owned());
             Ok(DataObject {

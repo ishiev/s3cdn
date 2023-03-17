@@ -11,7 +11,7 @@ use rocket::{
         Figment, Profile,
     }, 
     State,
-    http::{Status, HeaderMap},
+    http::Status,
     Request, request::{FromRequest, Outcome},
 };
 use s3::{
@@ -26,7 +26,7 @@ mod cache;
 use crate::{
     config::Config,
     responder::CacheResponder,
-    cache::{DataObject, ObjectKey, ObjectCache},
+    cache::{DataObject, ObjectKey, ObjectCache, ConditionalHeaders},
 };
 
 
@@ -64,41 +64,17 @@ fn default_catcher(status: Status, _: &Request) -> String {
     format!("{}", status)
 }
 
-struct ConditionalHeaders<'r> {
-    if_modified_since: Option<&'r str>,
-    if_none_match: Option<&'r str>
-}
-
-impl<'r> ConditionalHeaders<'r> {
-    const IF_MODIFIED_SINCE: &'static str = "if-modified-since";
-    const IF_NONE_MATCH: &'static str = "if-none-match";
-
-    fn headers(&self) -> HeaderMap {
-        let mut map = HeaderMap::new();
-        if let Some(value) = self.if_modified_since {
-            map.add_raw(Self::IF_MODIFIED_SINCE, value);
-        }
-        if let Some(value) = self.if_none_match {
-            map.add_raw(Self::IF_NONE_MATCH, value);
-        }
-        map
-    }
-}
-
+/// Request guard for conditional headers
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for ConditionalHeaders<'r> {
     type Error = std::convert::Infallible;
 
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         Outcome::Success(
-            Self {
-                if_modified_since: req.headers().get_one(Self::IF_MODIFIED_SINCE),
-                if_none_match: req.headers().get_one(Self::IF_NONE_MATCH)
-            }
+            ConditionalHeaders::from(req.headers())
         )
     }
 }
-
 
 #[get("/<bucket_name>/<path..>")]
 async fn index<'r>(
@@ -109,37 +85,50 @@ async fn index<'r>(
     cache: &'r State<ObjectCache>,
 ) -> Result<CacheResponder<'r, 'static, DataObject>, Error> {
     // configure S3 Bucket
-    let bucket = {
-        let mut bucket = Bucket::new(
-            bucket_name, 
-            config.connection.region.as_ref().unwrap().to_owned(), 
-            config.creds.to_owned()
-        )?;
-        // set timeout from config or infinite
-        bucket.set_request_timeout(config.connection.timeout.map(Duration::from_secs));
-        // set path- or virtual host bucket style 
-        if config.connection.pathstyle {
-            bucket.set_path_style();
-        } else {
-            bucket.set_subdomain_style();
-        }
-        // set conditional request headers
-        for h in condition.headers().into_iter() {
-            bucket.add_header(h.name().as_str(), h.value());
-        }
-        bucket
-    };
+    let mut bucket = Bucket::new(
+        bucket_name, 
+        config.connection.region.as_ref().unwrap().to_owned(), 
+        config.creds.to_owned()
+    )?;
+    // set timeout from config or infinite
+    bucket.set_request_timeout(config.connection.timeout.map(Duration::from_secs));
+    // set path- or virtual host bucket style 
+    if config.connection.pathstyle {
+        bucket.set_path_style();
+    } else {
+        bucket.set_subdomain_style();
+    }
+    
+    // set conditional headers from request
+    for h in condition.headers().into_iter() {
+        bucket.add_header(h.name().as_str(), h.value());
+    }
 
+    // make object key for cache request
     let key = ObjectKey {
         bucket: bucket_name,
         key: &path,
     };
-    // origin source closure
-    let origin = || async {
-        Ok(DataObject::from(bucket.get_object_stream(path.to_string_lossy()).await?))
+    
+    // make origin source closure
+    let origin = | condition: Option<ConditionalHeaders> | {
+        // add or replace conditional headers for cache revalidate requests
+        if let Some(condition) = condition {
+            for h in condition.headers().into_iter() {
+                bucket.add_header(h.name().as_str(), h.value());
+            }
+        };
+        // construct object path string
+        let path = path.to_string_lossy();
+        // return future to get object from origin with captured context
+        async move {
+            Ok(DataObject::from(bucket.get_object_stream(path).await?))
+        }
     };
+    
+    // get object from cache or from origin
     let object = cache.get_object(key, origin).await?;
-
+    
     Ok(CacheResponder::new(
         object,
         cache
