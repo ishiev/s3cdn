@@ -5,6 +5,7 @@ base_path = "/"
 
 [default.cache]
 mode = "Internal"
+max_age = 30
 root = "data"
 use_stale = 3600
 

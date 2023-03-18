@@ -17,7 +17,8 @@ impl From<ResponseDataStream> for DataObject {
     fn from(s: ResponseDataStream) -> Self {
         DataObject { 
             meta: ObjectMeta::from(&s.headers),
-            stream: s.bytes
+            stream: s.bytes,
+            status: None
         }
     }
 }
@@ -26,8 +27,12 @@ impl<'r> Responder<'r, 'static> for DataObject {
     fn respond_to(self, _: &'r Request<'_>) -> Result<'static> {
         let reader = StreamReader::new(self.stream);
         let mut builder = Response::build();
-        // add nessesary headers
+        // add headers from metadata
         for h in self.meta.headers().into_iter() {
+            builder.header(h);
+        }
+        // add status header
+        if let Some(h) = self.status {
             builder.header(h);
         }
         builder

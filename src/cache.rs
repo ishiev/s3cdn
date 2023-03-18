@@ -192,12 +192,11 @@ impl<'r> ConditionalHeaders<'r> {
 }
 
 /// Construct from object meta
-impl <'r> From<&'r ObjectMeta> for ConditionalHeaders<'r> {
-    fn from(value: &'r ObjectMeta) -> Self {
+impl <'r> From<ObjectMeta> for ConditionalHeaders<'r> {
+    fn from(value: ObjectMeta) -> Self {
         let if_modified_since = value.last_modified
             .map(|x| HttpDate::from(x).to_string().into());
         let if_none_match = value.etag
-            .as_ref()
             .map(Cow::from);
         Self {
             if_modified_since,
@@ -219,26 +218,45 @@ impl <'r> From<&'r HeaderMap<'r>> for ConditionalHeaders<'r> {
 /// Cached data object 
 pub struct DataObject {
     pub meta: ObjectMeta,
-    pub stream: DataStream
+    pub stream: DataStream,
+    pub status: Option<Header<'static>>
 }
 
 /// Variants for cache object revalidation
 enum ValidationResult {
-    NotModified,
-    Modified(DataObject),
-    NotFound,
+    Origin(DataObject),
+    Fresh(DataObject),
+    Revalidated(DataObject),
+    Updated(DataObject),
+    Stale(DataObject),
+    NotFound(S3Error),
     Err(S3Error)
 }
 
-impl From<Result<DataObject, S3Error>> for ValidationResult {
-    fn from(value: Result<DataObject, S3Error>) -> Self {
-        match value {
-            Ok(object) => Self::Modified(object),
-            Err(S3Error::Http(304, _)) => Self::NotModified,
-            Err(S3Error::Http(404, _)) => Self::NotFound,
-            Err(e) => Self::Err(e),
-        }
+impl ValidationResult {
+    const HEADER_NAME: &'static str = "x-s3cdn-status";
+    const ORIGIN: &'static str = "Origin";
+    const FRESH: &'static str = "Fresh";
+    const REVALIDATED: &'static str = "Revalidated";
+    const UPDATED: &'static str = "Updated";
+    const STALE: &'static str = "Stale";
+    const NOT_FOUND: &'static str = "NotFound";
+    const ERROR: &'static str = "Error";
+
+    /// Make x-s3cdn-status header from &self
+    fn header(&self) -> Header<'static> {
+        let value = match self {
+            Self::Origin(_) => Self::ORIGIN,
+            Self::Fresh(_) => Self::FRESH,
+            Self::Revalidated(_) => Self::REVALIDATED,
+            Self::Updated(_) => Self::UPDATED,
+            Self::Stale(_) => Self::STALE,
+            Self::NotFound(_) => Self::NOT_FOUND,
+            Self::Err(_) => Self::ERROR,
+        };
+        Header::new(Self::HEADER_NAME, value)
     }
+
 }
 
 /// Object cache
@@ -304,11 +322,12 @@ impl ObjectCache {
                 // decode meta from json
                 let meta: ObjectMeta = serde_json::from_value(md.metadata)
                     .map_err(|e| S3Error::Http(500, e.to_string()))?;
-                // get stream from cache
+                // get stream from cache and construct object
                 let stream = read_stream(cache, sri);
                 Some(DataObject {
                     meta,
-                    stream
+                    stream,
+                    status: None,
                 })
             } else {
                 None
@@ -316,18 +335,96 @@ impl ObjectCache {
         } else {
             None
         };
-        // return obj from cache or from origin
-        if let Some(obj) = try_obj {
-            Ok(obj)
+
+        // validate cache object
+        let res = self.validate(try_obj, origin).await;
+        let status = res.header();
+        // modify cache (if nessesary) and return result
+        match res {
+            ValidationResult::Origin(obj) => {
+                // got new object from origin - save stream to cache
+                let stream = save_stream(
+                    cache, 
+                    key, 
+                    obj.stream, 
+                    obj.meta.to_owned()
+                );
+                Ok(DataObject {
+                    meta: obj.meta,
+                    stream,
+                    status: Some(status)
+                })
+            },
+            ValidationResult::Fresh(mut obj) => {
+                // fresh from cache - return with status
+                obj.status = Some(status);
+                Ok(obj)
+            },
+            ValidationResult::Revalidated(mut obj) => {
+                // cache object revalidated by origin
+                // TODO: rerfresh cache metadata
+                obj.status = Some(status);
+                Ok(obj)
+            },
+            ValidationResult::Updated(mut obj) => {
+                // got updated object from origin
+                // TODO: replace object in cache
+                obj.status = Some(status);
+                Ok(obj)
+            },
+            ValidationResult::Stale(mut obj) => {
+                // got stale object from cache - return with status
+                obj.status = Some(status);
+                Ok(obj)
+            },
+            ValidationResult::NotFound(e) => {
+                // object not found in origin
+                // TODO: remove from cache
+                Err(e)
+            },
+            ValidationResult::Err(e) => Err(e)
+        }
+    }
+
+    /// Validate object or get from origin
+    async fn validate<'a, F, Fut>(&self, obj: Option<DataObject>, origin: F)
+    -> ValidationResult 
+    where
+        F: FnOnce(Option<ConditionalHeaders<'a>>)->Fut,
+        Fut: Future<Output = Result<DataObject, S3Error>>
+    {
+        if let Some(obj) = obj {         
+
+            let time = obj.meta.date
+                .unwrap_or(std::time::UNIX_EPOCH);
+            let age = SystemTime::now()
+                .duration_since(time)
+                .unwrap_or_default()
+                .as_secs();
+            
+            // check the object age
+            if age > self.config.max_age.unwrap_or_default() {
+                // object expired, need revalidation
+                let conditional = ConditionalHeaders::from(obj.meta.clone());
+                // request origin for revalidate
+                match origin(Some(conditional)).await {
+                    Ok(new_obj) => ValidationResult::Updated(new_obj),
+                    Err(S3Error::Http(304, _)) => ValidationResult::Revalidated(obj),
+                    Err(S3Error::Http(404, msg)) => ValidationResult::NotFound(
+                        S3Error::Http(404, format!("Object was removed from origin, error message: {msg}"))
+                    ),
+                    Err(e) => ValidationResult::Err(e),
+                }
+            } else {
+                // object fresh, return back
+                ValidationResult::Fresh(obj)
+            }
         } else {
-            // get object from origin source function
-            let obj = origin(None).await?;
-            // save to cache
-            let stream = save_stream(cache, key, obj.stream, obj.meta.to_owned());
-            Ok(DataObject {
-                meta: obj.meta,
-                stream
-            })
+            // get object from origin source
+            match origin(None).await {
+                Ok(new_obj) => ValidationResult::Origin(new_obj),
+                Err(e) => ValidationResult::Err(e)
+            }  
         }
     }
 }
