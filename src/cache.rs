@@ -311,44 +311,27 @@ impl ObjectCache {
         let cache = self.config.root
             .as_ref()
             .ok_or(S3Error::Http(500, "Cache root config param not defined".to_string()))?;
+        let key = key.as_ref().cache_key();
         // try to get object from cache
-        // check key in cache metadata
-        let try_obj = if let Some(md) = cacache::metadata(cache, key.as_ref().cache_key())
-            .await
-            .map_err(|e| S3Error::Http(500, e.to_string()))? {
-            // check data in cache
-            let sri = md.integrity;
-            if cacache::exists(cache, &sri).await {
-                // decode meta from json
-                let meta: ObjectMeta = serde_json::from_value(md.metadata)
-                    .map_err(|e| S3Error::Http(500, e.to_string()))?;
-                // get stream from cache and construct object
-                let stream = read_stream(cache, sri);
-                Some(DataObject {
-                    meta,
-                    stream,
-                    status: None,
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
+        let (obj, sri) = try_get_object(cache, &key)
+            .await? 
+            .map_or((None, None), |(obj, sri)| (Some(obj), Some(sri)));
         // validate cache object
-        let res = self.validate(try_obj, origin).await;
+        let res = self.validate(obj, origin).await;
         let status = res.header();
+        
         // modify cache (if nessesary) and return result
         match res {
             ValidationResult::Origin(obj) => {
-                // got new object from origin - save stream to cache
+                // got new object from origin
+                // save stream to cache
                 let stream = save_stream(
                     cache, 
                     key, 
                     obj.stream, 
                     obj.meta.to_owned()
                 );
+                // return new object
                 Ok(DataObject {
                     meta: obj.meta,
                     stream,
@@ -356,30 +339,69 @@ impl ObjectCache {
                 })
             },
             ValidationResult::Fresh(mut obj) => {
-                // fresh from cache - return with status
+                // fresh from cache 
+                // return with status
                 obj.status = Some(status);
                 Ok(obj)
             },
             ValidationResult::Revalidated(mut obj) => {
                 // cache object revalidated by origin
-                // TODO: rerfresh cache metadata
-                obj.status = Some(status);
+                // first remove old metadata from cache
+                cacache::remove(cache, &key)
+                    .await
+                    .map_err(|e| S3Error::Http(500,format!("Error remove metadata: {e}")))?;
+                // update time and status
+                obj.meta.date = Some(SystemTime::now());
+                obj.status = Some(status);  
+                // make new metadata
+                let sri = sri
+                    .ok_or(S3Error::Http(500, "Error get sri while removing object from cache".to_string()))?;
+                // insert metadata with updated time
+                let opts = WriteOpts::new()
+                    .integrity(sri)
+                    .size(obj.meta.content_length.unwrap_or(0))
+                    .metadata(json!(obj.meta));
+                cacache::index::insert_async(cache, &key, opts)
+                    .await
+                    .map_err(|e| S3Error::Http(500,format!("Error insert new metadata: {e}")))?;
+                // return object from cache
                 Ok(obj)
             },
-            ValidationResult::Updated(mut obj) => {
+            ValidationResult::Updated(obj) => {
                 // got updated object from origin
-                // TODO: replace object in cache
-                obj.status = Some(status);
-                Ok(obj)
+                // replace object in cache
+                let stream = save_stream(
+                    cache, 
+                    key, 
+                    obj.stream, 
+                    obj.meta.to_owned()
+                );
+                // return object from origin
+                Ok(DataObject {
+                    meta: obj.meta,
+                    stream,
+                    status: Some(status)
+                })
             },
             ValidationResult::Stale(mut obj) => {
-                // got stale object from cache - return with status
+                // got stale object from cache
+                // return with status
                 obj.status = Some(status);
                 Ok(obj)
             },
             ValidationResult::NotFound(e) => {
                 // object not found in origin
-                // TODO: remove from cache
+                // remove object from cache
+                let sri = sri
+                    .ok_or(S3Error::Http(500, "Error get sri while removing object from cache".to_string()))?;
+                cacache::remove_hash(cache, &sri)
+                    .await
+                    .map_err(|e| S3Error::Http(500,format!("Error remove object: {e}")))?;
+                // remove metadata from cache
+                cacache::remove(cache, key)
+                    .await
+                    .map_err(|e| S3Error::Http(500,format!("Error remove metadata: {e}")))?;
+                // return error
                 Err(e)
             },
             ValidationResult::Err(e) => Err(e)
@@ -401,9 +423,10 @@ impl ObjectCache {
                 .duration_since(time)
                 .unwrap_or_default()
                 .as_secs();
+            let max_age = self.config.max_age.unwrap_or_default();
             
             // check the object age
-            if age > self.config.max_age.unwrap_or_default() {
+            if age > max_age{
                 // object expired, need revalidation
                 let conditional = ConditionalHeaders::from(obj.meta.clone());
                 // request origin for revalidate
@@ -413,7 +436,16 @@ impl ObjectCache {
                     Err(S3Error::Http(404, msg)) => ValidationResult::NotFound(
                         S3Error::Http(404, format!("Object was removed from origin, error message: {msg}"))
                     ),
-                    Err(e) => ValidationResult::Err(e),
+                    Err(e) => {
+                        // check for stale config
+                        match self.config.use_stale {
+                            Some(stale) if age < stale + max_age => {
+                                // can return stale object from cache
+                                ValidationResult::Stale(obj)
+                            },
+                            _ => ValidationResult::Err(e)
+                        }   
+                    }
                 }
             } else {
                 // object fresh, return back
@@ -429,7 +461,38 @@ impl ObjectCache {
     }
 }
 
-fn save_stream<'a, P: AsRef<Path>, K: AsRef<ObjectKey<'a>>>(
+async fn try_get_object<P: AsRef<Path>, K: AsRef<str>>(
+    path: P,
+    key: K
+) -> Result<Option<(DataObject, Integrity)>, S3Error> {
+    if let Some(md) = cacache::metadata(&path, key)
+        .await
+        .map_err(|e| S3Error::Http(500, e.to_string()))? {
+        // check data in cache
+        let sri = md.integrity;
+        if cacache::exists(&path, &sri).await {
+            // decode meta from json
+            let meta: ObjectMeta = serde_json::from_value(md.metadata)
+                .map_err(|e| S3Error::Http(500, e.to_string()))?;
+            // get stream from cache and construct object
+            let stream = read_stream(&path, sri.to_owned());
+            Ok(Some((
+                DataObject {
+                    meta,
+                    stream,
+                    status: None,
+                },
+                sri
+            )))
+        } else {
+            Ok(None)
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+fn save_stream<P: AsRef<Path>, K: AsRef<str>>(
     path: P,
     key: K,
     input: DataStream,
@@ -440,7 +503,7 @@ fn save_stream<'a, P: AsRef<Path>, K: AsRef<ObjectKey<'a>>>(
         cache.push(path);
         cache
     };
-    let key = key.as_ref().cache_key();
+    let key = String::from(key.as_ref());
     let stream = try_stream! {
         // create writer for store stream in cache
         let mut fd = {
@@ -476,7 +539,6 @@ fn save_stream<'a, P: AsRef<Path>, K: AsRef<ObjectKey<'a>>>(
     // return pinned stream
     Box::pin(stream)   
 }
-
 
 fn read_stream<P: AsRef<Path>>(
     path: P, 
@@ -552,7 +614,7 @@ mod test {
         let key = ObjectKey {
             bucket: "bucket1",
             key: Path::new("my key")
-        };
+        }.cache_key();
 
         let meta1 = ObjectMeta { 
             content_type: Some(ContentType::HTML.to_string()), 
@@ -573,7 +635,7 @@ mod test {
         );
 
         // save input to cache and return persisted stream
-        let saved = save_stream(dir, key, input, meta1.clone());
+        let saved = save_stream(dir, &key, input, meta1.clone());
         // read to buffer1
         let data1 = {
             let mut reader = StreamReader::new(saved);
@@ -587,7 +649,7 @@ mod test {
         //pause().await;
 
         // get stream from cache
-        let md = cacache::metadata(dir, key.cache_key()).await.unwrap().unwrap();
+        let md = cacache::metadata(dir, &key).await.unwrap().unwrap();
         let sri = md.integrity;
         let meta2: ObjectMeta = serde_json::from_value(md.metadata).unwrap();
         let cached = read_stream(dir, sri);
