@@ -346,21 +346,17 @@ impl ObjectCache {
             },
             ValidationResult::Revalidated(mut obj) => {
                 // cache object revalidated by origin
-                // first remove old metadata from cache
-                cacache::remove(cache, &key)
-                    .await
-                    .map_err(|e| S3Error::Http(500,format!("Error remove metadata: {e}")))?;
                 // update time and status
                 obj.meta.date = Some(SystemTime::now());
                 obj.status = Some(status);  
                 // make new metadata
                 let sri = sri
                     .ok_or(S3Error::Http(500, "Error get sri while removing object from cache".to_string()))?;
-                // insert metadata with updated time
                 let opts = WriteOpts::new()
                     .integrity(sri)
                     .size(obj.meta.content_length.unwrap_or(0))
                     .metadata(json!(obj.meta));
+                // insert metadata with updated time
                 cacache::index::insert_async(cache, &key, opts)
                     .await
                     .map_err(|e| S3Error::Http(500,format!("Error insert new metadata: {e}")))?;
@@ -397,10 +393,6 @@ impl ObjectCache {
                 cacache::remove_hash(cache, &sri)
                     .await
                     .map_err(|e| S3Error::Http(500,format!("Error remove object: {e}")))?;
-                // remove metadata from cache
-                cacache::remove(cache, key)
-                    .await
-                    .map_err(|e| S3Error::Http(500,format!("Error remove metadata: {e}")))?;
                 // return error
                 Err(e)
             },
