@@ -90,6 +90,7 @@ async fn index<'r>(
         config.connection.region.as_ref().unwrap().to_owned(), 
         config.creds.to_owned()
     )?;
+    
     // set timeout from config or infinite
     bucket.set_request_timeout(config.connection.timeout.map(Duration::from_secs));
     // set path- or virtual host bucket style 
@@ -98,21 +99,10 @@ async fn index<'r>(
     } else {
         bucket.set_subdomain_style();
     }
-    
-    // set conditional headers from request
-    for h in condition.headers().into_iter() {
-        bucket.add_header(h.name().as_str(), h.value());
-    }
-
-    // make object key for cache request
-    let key = ObjectKey {
-        bucket: bucket_name,
-        key: &path,
-    };
-    
+      
     // make origin source closure
     let origin = | condition: Option<ConditionalHeaders> | {
-        // add or replace conditional headers for cache revalidate requests
+        // add conditional headers for revalidate requests
         if let Some(condition) = condition {
             for h in condition.headers().into_iter() {
                 bucket.add_header(h.name().as_str(), h.value());
@@ -125,9 +115,20 @@ async fn index<'r>(
             Ok(DataObject::from(bucket.get_object_stream(path).await?))
         }
     };
-    
-    // get object from cache or from origin
-    let object = cache.get_object(key, origin).await?;
+
+    // get object from cache or revalidate from origin
+    let object = if condition.is_empty() {
+        // make object key for cache request
+        let key = ObjectKey {
+            bucket: bucket_name,
+            key: &path,
+        };
+        // get object from cache or from origin
+        cache.get_object(key, origin).await?
+    } else {
+        // revalidate from origin
+        origin(Some(condition)).await?
+    };
     
     Ok(CacheResponder::new(
         object,

@@ -189,6 +189,10 @@ impl<'r> ConditionalHeaders<'r> {
         }
         map
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.if_modified_since.is_none() && self.if_none_match.is_none()
+    }
 }
 
 /// Construct from object meta
