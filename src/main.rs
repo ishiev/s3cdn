@@ -162,18 +162,16 @@ fn rocket() -> _ {
         }
     }
 
-    println!("Config: {:?}", config);
-
+    println!("Starting {}, {}",
+        env!("CARGO_PKG_DESCRIPTION"),
+        config.ident
+    );    
+    
     // setup cache
     let cache = ObjectCache::from(config.cache.take().unwrap_or_default());
 
     // set server base path from config
     let base_path = config.base_path.to_owned();
-
-    println!("Starting {}, {}",
-        env!("CARGO_PKG_DESCRIPTION"),
-        config.ident
-    );
 
     rocket::custom(figment)
         .manage(config)
