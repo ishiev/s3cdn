@@ -101,13 +101,11 @@ async fn index<'r>(
     }
       
     // make origin source closure
-    let origin = | condition: Option<ConditionalHeaders> | {
+    let origin = | condition: ConditionalHeaders | {
         // add conditional headers for revalidate requests
-        if let Some(condition) = condition {
-            for h in condition.headers().into_iter() {
-                bucket.add_header(h.name().as_str(), h.value());
-            }
-        };
+        for h in condition.headers().into_iter() {
+            bucket.add_header(h.name().as_str(), h.value());
+        }
         // construct object path string
         let path = path.to_string_lossy();
         // return future to get object from origin with captured context
@@ -116,19 +114,13 @@ async fn index<'r>(
         }
     };
 
-    // get object from cache or revalidate from origin
-    let object = if condition.is_empty() {
-        // make object key for cache request
-        let key = ObjectKey {
-            bucket: bucket_name,
-            key: &path,
-        };
-        // get object from cache or from origin
-        cache.get_object(key, origin).await?
-    } else {
-        // revalidate from origin
-        origin(Some(condition)).await?
+    // make object key for cache request
+    let key = ObjectKey {
+        bucket: bucket_name,
+        key: &path,
     };
+    // get object from cache or revalidate
+    let object = cache.get_object(key, origin, condition).await?;
     
     Ok(CacheResponder::new(
         object,

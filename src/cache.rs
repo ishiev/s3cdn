@@ -170,6 +170,7 @@ impl From<&HashMap<String, String>> for ObjectMeta {
 }
 
 // Values from conditional request
+#[derive(Default, Debug)]
 pub struct ConditionalHeaders<'r> {
     if_modified_since: Option<Cow<'r, str>>,
     if_none_match: Option<Cow<'r, str>>
@@ -279,6 +280,12 @@ impl From<ConfigObjectCache> for ObjectCache {
     }
 }
 
+impl Drop for ObjectCache {
+    fn drop(&mut self) {
+        info!("DROPPING CACHE!")
+    }
+}
+
 impl ObjectCache {
     /// Get cache-control headers for response
     pub fn headers(&self) -> HeaderMap<'static> {
@@ -290,36 +297,38 @@ impl ObjectCache {
     }
 
     /// Get object from cache or from origin source, bypass if mode != Internal
-    pub async fn get_object<'a, K, F, Fut>(&self, key: K, origin: F)
+    pub async fn get_object<'a, K, F, Fut>(&self, key: K, origin: F, condition: ConditionalHeaders<'a>)
     -> Result<DataObject, S3Error> 
     where 
         K: AsRef<ObjectKey<'a>> + std::marker::Copy,
-        F: FnOnce(Option<ConditionalHeaders <'a>>)->Fut,
+        F: FnOnce(ConditionalHeaders<'a>)->Fut,
         Fut: Future<Output = Result<DataObject, S3Error>>
     {
         if self.mode() == CacheMode::Internal {
-            self.get_cached_object(key, origin).await
+            self.get_cached_object(key, origin, condition).await
         } else {
-            origin(None).await
+            origin(condition).await
         }
     }
 
     /// Get object from cache or from origin source
-    pub async fn get_cached_object<'a, K, F, Fut>(&self, key: K, origin: F) 
+    pub async fn get_cached_object<'a, K, F, Fut>(&self, key: K, origin: F, condition: ConditionalHeaders<'a>) 
     -> Result<DataObject, S3Error> 
     where 
         K: AsRef<ObjectKey<'a>> + std::marker::Copy,
-        F: FnOnce(Option<ConditionalHeaders<'a>>)->Fut,
+        F: FnOnce(ConditionalHeaders<'a>)->Fut,
         Fut: Future<Output = Result<DataObject, S3Error>>
     {
         let cache = self.config.root
             .as_ref()
             .ok_or(S3Error::Http(500, "Cache root config param not defined".to_string()))?;
         let key = key.as_ref().cache_key();
+        
         // try to get object from cache
         let (obj, sri) = try_get_object(cache, &key)
             .await? 
             .map_or((None, None), |(obj, sri)| (Some(obj), Some(sri)));
+        
         // validate cache object
         let res = self.validate(obj, origin).await;
         let status = res.header();
@@ -346,7 +355,7 @@ impl ObjectCache {
                 // fresh from cache 
                 // return with status
                 obj.status = Some(status);
-                Ok(obj)
+                check_condition(obj, condition)
             },
             ValidationResult::Revalidated(mut obj) => {
                 // cache object revalidated by origin
@@ -364,8 +373,8 @@ impl ObjectCache {
                 cacache::index::insert_async(cache, &key, opts)
                     .await
                     .map_err(|e| S3Error::Http(500,format!("Error insert new metadata: {e}")))?;
-                // return object from cache
-                Ok(obj)
+                // return from cache
+                check_condition(obj, condition)
             },
             ValidationResult::Updated(obj) => {
                 // got updated object from origin
@@ -387,7 +396,7 @@ impl ObjectCache {
                 // got stale object from cache
                 // return with status
                 obj.status = Some(status);
-                Ok(obj)
+                check_condition(obj, condition)
             },
             ValidationResult::NotFound(e) => {
                 // object not found in origin
@@ -404,11 +413,11 @@ impl ObjectCache {
         }
     }
 
-    /// Validate object or get from origin
+    /// Validate object or get new from origin
     async fn validate<'a, F, Fut>(&self, obj: Option<DataObject>, origin: F)
     -> ValidationResult 
     where
-        F: FnOnce(Option<ConditionalHeaders<'a>>)->Fut,
+        F: FnOnce(ConditionalHeaders<'a>)->Fut,
         Fut: Future<Output = Result<DataObject, S3Error>>
     {
         if let Some(obj) = obj {         
@@ -426,7 +435,7 @@ impl ObjectCache {
                 // object expired, need revalidation
                 let conditional = ConditionalHeaders::from(obj.meta.clone());
                 // request origin for revalidate
-                match origin(Some(conditional)).await {
+                match origin(conditional).await {
                     Ok(new_obj) => ValidationResult::Updated(new_obj),
                     Err(S3Error::Http(304, _)) => ValidationResult::Revalidated(obj),
                     Err(S3Error::Http(404, msg)) => ValidationResult::NotFound(
@@ -449,12 +458,43 @@ impl ObjectCache {
             }
         } else {
             // get object from origin source
-            match origin(None).await {
+            match origin(ConditionalHeaders::default()).await {
                 Ok(new_obj) => ValidationResult::Origin(new_obj),
                 Err(e) => ValidationResult::Err(e)
             }  
         }
     }
+}
+
+fn check_condition(obj: DataObject, condition: ConditionalHeaders) 
+-> Result<DataObject, S3Error> {
+    // check etag
+    if let Some(req_etag) = condition.if_none_match {
+        if let Some(ref obj_etag) = obj.meta.etag {
+            if &req_etag == obj_etag {
+                // not modified
+                return Err(S3Error::Http(304, String::new()))
+            } else {
+                // modified
+                return Ok(obj)
+            }
+        }
+    } 
+    // check modified time
+    if let Some(req_modified_str) = condition.if_modified_since {
+        if let Some(ref obj_modified) = obj.meta.last_modified {
+            let req_modified = HttpDate::from_str(req_modified_str.as_ref())
+                .ok()
+                .map(|x| x.into())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            if &req_modified == obj_modified {
+                // not modified
+                return Err(S3Error::Http(304, String::new()))
+            }
+        }
+    }
+    // modified
+    Ok(obj)
 }
 
 async fn try_get_object<P: AsRef<Path>, K: AsRef<str>>(
@@ -472,14 +512,14 @@ async fn try_get_object<P: AsRef<Path>, K: AsRef<str>>(
                 .map_err(|e| S3Error::Http(500, e.to_string()))?;
             // get stream from cache and construct object
             let stream = read_stream(&path, sri.to_owned());
-            Ok(Some((
-                DataObject {
+            Ok(Some(
+                (DataObject {
                     meta,
                     stream,
                     status: None,
                 },
-                sri
-            )))
+                sri)
+            ))
         } else {
             Ok(None)
         }
