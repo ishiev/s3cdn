@@ -22,6 +22,7 @@ use s3::{
 mod config;
 mod responder;
 mod cache;
+mod metacache;
 
 use crate::{
     config::Config,

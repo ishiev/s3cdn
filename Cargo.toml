@@ -21,6 +21,7 @@ ssri = "8"
 url = { version = "2", features = ["serde"] }
 cacache = { version = "*", default-features = false, features = ["tokio-runtime"] }
 time = "0.3"
+moka = { version = "0.10", features = ["future"] }
 
 [patch."https://github.com/ishiev/rust-s3.git"]
 rust-s3 = { path = "../rust-s3/s3" }

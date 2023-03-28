@@ -360,7 +360,7 @@ impl ObjectCache {
                 obj.status = Some(status);  
                 // make new metadata
                 let sri = sri
-                    .ok_or(S3Error::Http(500, "Error get sri while removing object from cache".to_string()))?;
+                    .ok_or(S3Error::Http(500, "Error get sri".to_string()))?;
                 let opts = WriteOpts::new()
                     .integrity(sri)
                     .size(obj.meta.content_length.unwrap_or(0))
@@ -374,7 +374,13 @@ impl ObjectCache {
             },
             ValidationResult::Updated(obj) => {
                 // got updated object from origin
-                // replace object in cache
+                // remove old object from cache
+                let sri = sri
+                    .ok_or(S3Error::Http(500, "Error get sri while updating object in cache".to_string()))?;
+                cacache::remove_hash(cache, &sri)
+                    .await
+                    .map_err(|e| S3Error::Http(500,format!("Error remove object: {e}")))?;
+                // save new object to cache
                 let stream = save_stream(
                     cache, 
                     key, 
