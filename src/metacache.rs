@@ -1,9 +1,20 @@
 use std::{
-    path::Path, time::{Duration, SystemTime, UNIX_EPOCH}, sync::Arc,
+    path::Path, 
+    time::Duration, 
+    sync::Arc,
 };
-
-use cacache::{WriteOpts, Value, Reader, Error, Writer};
-use moka::{future::Cache, notification::RemovalCause, Entry};
+use cacache::{
+    WriteOpts, 
+    Value, 
+    Reader, 
+    Writer,
+    Error,
+};
+use moka::{
+    future::Cache, 
+    notification::RemovalCause, 
+    Entry
+};
 use ssri::Integrity;
 
 
