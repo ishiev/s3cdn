@@ -1,8 +1,8 @@
 use std::{
-    path::Path, time::Duration, sync::Arc,
+    path::Path, time::{Duration, SystemTime, UNIX_EPOCH}, sync::Arc,
 };
 
-use cacache::{WriteOpts, Value, Reader};
+use cacache::{WriteOpts, Value, Reader, Error, Writer};
 use moka::{future::Cache, notification::RemovalCause, Entry};
 use ssri::Integrity;
 
@@ -18,7 +18,7 @@ pub struct Metadata {
     // size of data associated with this entry
     pub size: Option<usize>,
     // arbitrary JSON  associated with this entry
-    pub metadata: Option<Value>,
+    pub metadata: Value,
 }
 
 /// Convert from cacache
@@ -27,9 +27,9 @@ impl From<cacache::Metadata> for Metadata {
         Self {
             key: md.key,
             integrity: Some(md.integrity),
-            time: Some(md.time),
-            size: Some(md.size),
-            metadata: Some(md.metadata),
+            time: if md.time == 0 { None } else { Some(md.time) },
+            size: if md.size == 0 { None } else { Some(md.size) },
+            metadata: md.metadata,
         }
     }
 }
@@ -64,10 +64,7 @@ impl From<Metadata> for WriteOpts {
         if let Some(time) = md.time {
             opts = opts.time(time)
         }
-        if let Some(meta) = md.metadata {
-            opts = opts.metadata(meta)
-        }
-        opts
+        opts.metadata(md.metadata)
     }
 }
 
@@ -135,11 +132,35 @@ impl <'a> MetaCache<'a> {
             .map(Entry::into_value) 
     }
 
+    pub async fn metadata_checked(&self, key: &str) -> Option<cacache::Metadata> {
+        if let Some(md) = self.metadata(key).await {
+            if let Some(sri) = md.integrity {
+                if cacache::exists(self.path, &sri).await {
+                    let md = cacache::Metadata {
+                        key: md.key,
+                        integrity: sri,
+                        time: md.time.unwrap_or_default(),
+                        size: md.size.unwrap_or_default(),
+                        metadata: md.metadata,
+                        raw_metadata: None,
+                    };
+                    Some(md)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
     pub async fn exists(&self, sri: &Integrity) -> bool {
         cacache::exists(self.path, sri).await
     }
 
-    pub async fn remove(&self, sri: &Integrity) -> Result<(), cacache::Error>{
+    pub async fn remove(&self, sri: &Integrity) -> Result<(), Error>{
         cacache::remove_hash(self.path, sri).await
     }
 
@@ -147,18 +168,18 @@ impl <'a> MetaCache<'a> {
         self.cache.insert(md.key.clone(), md).await
     }
 
-    pub async fn writer(&self, md: Metadata) -> Result<cacache::Writer, cacache::Error> {
+    pub async fn writer(&self, md: Metadata) -> Result<Writer, Error> {
         WriteOpts::from(md).open_hash(self.path).await
     }
 
-    pub async fn commit(&self, mut md: Metadata, writer: cacache::Writer) -> Result<Integrity, cacache::Error> {
+    pub async fn commit(&self, mut md: Metadata, writer: Writer) -> Result<Integrity, Error> {
         let sri = writer.commit().await?;
         md.integrity = Some(sri.clone());
         self.insert(md).await;
         Ok(sri)
     }
 
-    pub async fn reader(&self, sri: Integrity) -> Result<cacache::Reader, cacache::Error> {
+    pub async fn reader(&self, sri: Integrity) -> Result<Reader, Error> {
         Reader::open_hash(&self.path, sri).await
     }
 }
