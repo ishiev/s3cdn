@@ -140,10 +140,11 @@ fn rocket() -> _ {
         .select(Profile::from_env_or("S3CDN_PROFILE", "default"));
 
     // extract the config, exit if error
-    let mut config: Config = figment.extract().unwrap_or_else(|err| {
-        eprintln!("Problem parsing config: {err}");
-        process::exit(1)
-    });
+    let mut config: Config = figment.extract()
+        .unwrap_or_else(|err| {
+            eprintln!("Problem parsing config: {err}");
+            process::exit(1)
+        });
 
     // sure for S3 region created
     if config.connection.region.is_none() {
@@ -154,21 +155,26 @@ fn rocket() -> _ {
             config.connection.make_custom_region();
         }
     }
+ 
+    // setup cache
+    let cache = ObjectCache::new(config.cache.take().unwrap_or_default())
+        .unwrap_or_else(|err| {
+            eprintln!("Cache init error: {err}");
+            process::exit(1)
+        });
+
 
     println!("Starting {}, {}",
         env!("CARGO_PKG_DESCRIPTION"),
         config.ident
     );    
-    
-    // setup cache
-    let cache = ObjectCache::from(config.cache.take().unwrap_or_default());
 
     // set server base path from config
     let base_path = config.base_path.to_owned();
 
     rocket::custom(figment)
-        .manage(config)
         .manage(cache)
+        .manage(config)
         .mount(base_path, routes![index])
         .register("/", catchers![default_catcher])
 }

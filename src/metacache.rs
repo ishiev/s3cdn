@@ -1,6 +1,6 @@
 use std::{
-    path::Path, 
-    time::Duration, 
+    path::PathBuf, 
+    time::{Duration, SystemTime, UNIX_EPOCH}, 
     sync::Arc,
 };
 use cacache::{
@@ -12,6 +12,7 @@ use cacache::{
 };
 use moka::{
     future::Cache, 
+    future::ConcurrentCacheExt,
     notification::RemovalCause, 
     Entry
 };
@@ -45,28 +46,11 @@ impl From<cacache::Metadata> for Metadata {
     }
 }
 
-/*
-/// Convert back to cacache
-impl From<Metadata> for cacache::Metadata {
-    fn from(md: Metadata) -> Self {
-        Self {
-            key: md.key,
-            integrity: md.integrity.unwrap_or_else(|| Integrity::from([0;0])),
-            time: md.time,
-            size: md.size,
-            metadata: md.metadata,
-            raw_metadata: None
-        }
-    }
-}
-
-*/
-
 /// Convert to write options
-impl From<Metadata> for WriteOpts {
-    fn from(md: Metadata) -> Self {
+impl From<&Metadata> for WriteOpts {
+    fn from(md: &Metadata) -> Self {
         let mut opts = WriteOpts::new();
-        if let Some(sri) = md.integrity {
+        if let Some(sri) = md.integrity.clone() {
             opts = opts.integrity(sri)
         }
         if let Some(size) = md.size {
@@ -75,31 +59,34 @@ impl From<Metadata> for WriteOpts {
         if let Some(time) = md.time {
             opts = opts.time(time)
         }
-        opts.metadata(md.metadata)
+        opts.metadata(md.metadata.clone())
     }
 }
 
 
 #[derive(Debug, Clone)]
-pub struct MetaCache<'a>  {
-    path: &'a Path,
+pub struct MetaCache  {
+    path: PathBuf,
     cache: Cache<String, Metadata>
 }
 
-impl <'a> MetaCache<'a> {
-    pub fn new(path: &'a Path, ttl: u64, capacity: u64) -> Self {
+impl MetaCache {
+    pub fn new(path: PathBuf, ttl: u64, capacity: u64) -> Self {
         // create eviction closure
         // eviction will save metadata to index file
-        let cache = path.to_owned();
+        let cache = path.clone();
         let listener = 
             move | key: Arc<String>, md: Metadata, cause: RemovalCause | {
-            // insert cached metadata to file
-            let opts = md.into();
-            if let Err(e) = cacache::index::insert(&cache, &key, opts) {
-                error!("Error commit cache metadata: {}", e);
-            } else {
-                info!("Commit metadata for key: {}, reason: {:?}", &key, cause)
-            }    
+                // update metadata only in-memory
+                if cause != RemovalCause::Replaced {
+                    // insert cached metadata to file
+                    let opts = WriteOpts::from(&md);
+                    if let Err(e) = cacache::index::insert(&cache, &key, opts) {
+                        error!("Error commit cache metadata: {}", e);
+                    } else {
+                        info!("Commit metadata for key: {}, reason: {:?}", &key, cause)
+                    }
+                }
         };
         // create cache
         let cache = Cache::builder()
@@ -114,20 +101,18 @@ impl <'a> MetaCache<'a> {
         }
     }
 
-    pub async fn save(&self, key: &str) {
-        self.cache.invalidate(key).await
-    } 
-
     pub fn save_all(&self) {
-        info!("Start saving to index: {} elements...", self.cache.entry_count());
-        self.cache.invalidate_all()
+        info!("Start saving metadata to index: {} element(s)...", self.cache.entry_count());
+        self.cache.invalidate_all();
+        self.cache.sync();
+        info!("Cache sync complete.");
     }     
 
     pub async fn metadata(&self, key: &str) -> Option<Metadata> {
         // make async block for index reading
         // return None if reading error
         let init = async {
-            cacache::index::find_async(self.path, key)
+            cacache::index::find_async(&self.path, key)
                 .await
                 .unwrap_or_else(|e| {
                     error!("Error read index: {}", e);
@@ -146,7 +131,7 @@ impl <'a> MetaCache<'a> {
     pub async fn metadata_checked(&self, key: &str) -> Option<cacache::Metadata> {
         if let Some(md) = self.metadata(key).await {
             if let Some(sri) = md.integrity {
-                if cacache::exists(self.path, &sri).await {
+                if self.exists(&sri).await {
                     let md = cacache::Metadata {
                         key: md.key,
                         integrity: sri,
@@ -168,24 +153,37 @@ impl <'a> MetaCache<'a> {
     }
 
     pub async fn exists(&self, sri: &Integrity) -> bool {
-        cacache::exists(self.path, sri).await
+        cacache::exists(&self.path, sri).await
     }
 
-    pub async fn remove(&self, sri: &Integrity) -> Result<(), Error>{
-        cacache::remove_hash(self.path, sri).await
+    pub async fn remove_hash(&self, sri: &Integrity) -> Result<(), Error>{
+        cacache::remove_hash(&self.path, sri).await
     }
 
     pub async fn insert(&self, md: Metadata) {
         self.cache.insert(md.key.clone(), md).await
     }
 
-    pub async fn writer(&self, md: Metadata) -> Result<Writer, Error> {
-        WriteOpts::from(md).open_hash(self.path).await
+    pub async fn update(&self, md: Metadata) {
+        if let Some(mut item) = self.cache.get(&md.key) {
+            item.integrity = md.integrity.or(item.integrity);
+            item.time = md.time.or(item.time);
+            item.size = md.size.or(item.size);
+            if !md.metadata.is_null() {
+                item.metadata = md.metadata
+            }
+            self.insert(item).await
+        }
+    }
+
+    pub async fn writer(&self, md: &Metadata) -> Result<Writer, Error> {
+        WriteOpts::from(md).open(&self.path, &md.key).await
     }
 
     pub async fn commit(&self, mut md: Metadata, writer: Writer) -> Result<Integrity, Error> {
         let sri = writer.commit().await?;
         md.integrity = Some(sri.clone());
+        md.time = if md.time.is_none() { Some(now()) } else { md.time} ;
         self.insert(md).await;
         Ok(sri)
     }
@@ -195,9 +193,15 @@ impl <'a> MetaCache<'a> {
     }
 }
 
-
-impl Drop for MetaCache<'_> {
+impl Drop for MetaCache {
     fn drop(&mut self) {
         self.save_all()
     }
+}
+
+fn now() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
 }
