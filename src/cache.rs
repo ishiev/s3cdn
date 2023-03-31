@@ -260,7 +260,6 @@ impl ValidationResult {
         };
         Header::new(Self::HEADER_NAME, value)
     }
-
 }
 
 /// Object cache
@@ -294,7 +293,8 @@ impl ObjectCache {
         Ok(Self {
             config,
             headers,
-            mc: Arc::new(MetaCache::new(path, ttl, 500_000))
+            mc: Arc::new(MetaCache::new(path, ttl, 500_000)
+                .map_err(|e| S3Error::Http(500, format!("Cache create error: {}", e)))?)
         })
     }
 
@@ -639,7 +639,7 @@ mod test {
             bucket: "bucket1",
             key: Path::new("my key")
         }.cache_key();
-        let mc: Arc<MetaCache> = Arc::new(MetaCache::new(PathBuf::from(dir), 30, 10));
+        let mc: Arc<MetaCache> = Arc::new(MetaCache::new(PathBuf::from(dir), 30, 10).unwrap());
 
         let meta1 = ObjectMeta { 
             content_type: Some(ContentType::HTML.to_string()), 

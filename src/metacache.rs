@@ -10,6 +10,7 @@ use cacache::{
     Writer,
     Error,
 };
+use lockfile::Lockfile;
 use moka::{
     future::Cache, 
     future::ConcurrentCacheExt,
@@ -64,14 +65,28 @@ impl From<&Metadata> for WriteOpts {
 }
 
 
-#[derive(Debug, Clone)]
 pub struct MetaCache  {
     path: PathBuf,
-    cache: Cache<String, Metadata>
+    cache: Cache<String, Metadata>,
+    _lock: Lockfile
 }
 
 impl MetaCache {
-    pub fn new(path: PathBuf, ttl: u64, capacity: u64) -> Self {
+    pub fn new(path: PathBuf, ttl: u64, capacity: u64) -> Result<Self, Error> {
+        // try to lock cache path
+        let lock = {
+            let mut lockfile = PathBuf::from(&path);
+            lockfile.push(".lockfile");
+            // create lockfile with all parents dir
+            Lockfile::create_with_parents(lockfile)
+                .map_err(|e| 
+                    Error::IoError(
+                        e.into_inner(), 
+                        format!("Cannot lock cache directory: {:?}. \
+                                Maybe another process is already running?", &path)
+                    )
+                )?
+        };
         // create eviction closure
         // eviction will save metadata to index file
         let cache = path.clone();
@@ -105,10 +120,11 @@ impl MetaCache {
             .eviction_listener_with_queued_delivery_mode(listener)
             .build();
         // return cache
-        MetaCache { 
+        Ok(MetaCache { 
             path, 
-            cache 
-        }
+            cache,
+            _lock: lock
+        })
     }
 
     pub fn save_all(&self) {

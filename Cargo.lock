@@ -996,6 +996,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "lockfile"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5be1cf190319c74ba3e45923624626ae2e43fe42ad7e60ff38ded81044c37630"
+
+[[package]]
 name = "log"
 version = "0.4.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1792,12 +1798,13 @@ checksum = "7b4b9743ed687d4b4bcedf9ff5eaa7398495ae14e61cba0a295704edbc7decde"
 
 [[package]]
 name = "s3cdn"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aws-region",
  "bytes",
  "cacache",
  "httpdate",
+ "lockfile",
  "moka",
  "rocket",
  "rust-s3",

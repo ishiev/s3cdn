@@ -155,11 +155,11 @@ fn rocket() -> _ {
             config.connection.make_custom_region();
         }
     }
- 
+
     // setup cache
     let cache = ObjectCache::new(config.cache.take().unwrap_or_default())
         .unwrap_or_else(|err| {
-            eprintln!("Cache init error: {err}");
+            eprintln!("Init error: {err}");
             process::exit(1)
         });
 
