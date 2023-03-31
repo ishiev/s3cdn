@@ -48,10 +48,10 @@ pub struct ConfigObjectCache {
     pub mode: CacheMode,
     pub root: Option<PathBuf>,
     pub max_age: Option<u64>,
-    pub max_size: Option<u64>,
-    pub inactive: Option<u64>,
+//    pub max_size: Option<u64>, // not implemented yet
+//    pub inactive: Option<u64>, // not implemented ye
     pub use_stale: Option<u64>,
-    pub background_update: Option<u64>,
+    pub index_checkpoint: Option<u64>,
 }
 
 impl ConfigObjectCache {
@@ -286,11 +286,10 @@ impl ObjectCache {
             .ok_or(S3Error::Http(500, "Cache root config param not defined!".to_string()))?;
         // cache-control headers
         let headers = config.make_headers();
-        // ttl for metadata items
+        // ttl for cache items 
         let ttl = max(
-            config.max_age.unwrap_or_default() + 
-            config.use_stale.unwrap_or_default(), 
-            3600*24
+            config.max_age.unwrap_or_default(), 
+            config.index_checkpoint.unwrap_or(3600*24)
         );
         Ok(Self {
             config,

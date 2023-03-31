@@ -19,7 +19,7 @@ use moka::{
 use ssri::Integrity;
 
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, PartialEq)]
 pub struct Metadata {
     // key this entry is stored under
     pub key: String,
@@ -77,17 +77,27 @@ impl MetaCache {
         let cache = path.clone();
         let listener = 
             move | key: Arc<String>, md: Metadata, cause: RemovalCause | {
-                // update metadata only in-memory
+                // replace only in-memory
                 if cause != RemovalCause::Replaced {
-                    // insert cached metadata to file
+                    // maybe it already exists?
+                    if let Some(index_md) = cacache::index::find(&cache, &key)
+                            .ok()
+                            .flatten() {
+                        if Metadata::from(index_md) == md {
+                            // already saved, do nothing
+                            info!("Drop metadata for key: {}, reason: {:?}", &key, cause);
+                            return;
+                        }
+                    }
+                    // insert cached metadata to index
                     let opts = WriteOpts::from(&md);
                     if let Err(e) = cacache::index::insert(&cache, &key, opts) {
                         error!("Error commit cache metadata: {}", e);
                     } else {
-                        info!("Commit metadata for key: {}, reason: {:?}", &key, cause)
+                        info!("Save metadata for key: {}, reason: {:?}", &key, cause)
                     }
                 }
-        };
+            };
         // create cache
         let cache = Cache::builder()
             .max_capacity(capacity)
@@ -105,7 +115,6 @@ impl MetaCache {
         info!("Start saving metadata to index: {} element(s)...", self.cache.entry_count());
         self.cache.invalidate_all();
         self.cache.sync();
-        info!("Cache sync complete.");
     }     
 
     pub async fn metadata(&self, key: &str) -> Option<Metadata> {
