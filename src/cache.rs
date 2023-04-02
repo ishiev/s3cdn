@@ -293,8 +293,10 @@ impl ObjectCache {
         Ok(Self {
             config,
             headers,
-            mc: Arc::new(MetaCache::new(path, ttl, 500_000)
-                .map_err(|e| S3Error::Http(500, format!("Cache create error: {}", e)))?)
+            mc: Arc::new(
+                MetaCache::new(path, ttl, 500_000)
+                    .map_err(|e| S3Error::Http(500, format!("Cache create error: {}", e)))?
+                )
         })
     }
 
@@ -474,6 +476,10 @@ impl ObjectCache {
                 Err(e) => ValidationResult::Err(e)
             }  
         }
+    }
+
+    pub async fn shutdown(&self) {
+        self.mc.shutdown().await;
     }
 }
 
@@ -668,9 +674,7 @@ mod test {
             reader.read_to_end(&mut data).await.unwrap();
             data
         };
-
-        mc.save_all();
-        
+      
         // uncomment to pause to manually edit the cache file and cause the integrity check to fail
         // press Enter in terminal to continue
         pause().await;
@@ -679,7 +683,7 @@ mod test {
         let md = cacache::metadata(dir, &key).await.unwrap().unwrap();
         let sri = md.integrity;
         let meta2: ObjectMeta = serde_json::from_value(md.metadata).unwrap();
-        let cached = read_stream(mc, sri);
+        let cached = read_stream(Arc::clone(&mc), sri);
         // read to buffer2
         let data2 = {
             let mut reader = StreamReader::new(cached);
@@ -695,6 +699,7 @@ mod test {
         assert_eq!(meta1, meta2);
 
         // clean up the cache
+        mc.shutdown().await;
         cacache::clear(dir).await.unwrap();
     }
 

@@ -1,5 +1,5 @@
 use std::{
-    path::PathBuf, 
+    path::{PathBuf, Path}, 
     time::{Duration, SystemTime, UNIX_EPOCH}, 
     sync::Arc,
 };
@@ -13,11 +13,11 @@ use cacache::{
 use lockfile::Lockfile;
 use moka::{
     future::Cache, 
-    future::ConcurrentCacheExt,
     notification::RemovalCause, 
     Entry
 };
 use ssri::Integrity;
+use tokio::{sync::{mpsc::{self, error::SendError}, RwLock}, task::{self, JoinHandle}};
 
 
 #[derive(Default, Debug, Clone, PartialEq)]
@@ -32,6 +32,29 @@ pub struct Metadata {
     pub size: Option<usize>,
     // arbitrary JSON  associated with this entry
     pub metadata: Value,
+}
+
+impl Metadata {
+    /// Save metadata to index file
+    async fn save(&self, cache: &Path, reason: &str) {
+        // maybe it already exists?
+        if let Some(index_md) = cacache::index::find_async(cache, &self.key).await
+                .ok()
+                .flatten() {
+            if Metadata::from(index_md) == *self {
+                // already saved, do nothing
+                debug!("Drop metadata for key: {}, reason: {}", &self.key, reason);
+                return;
+            }
+        }
+        // insert to index
+        let opts = WriteOpts::from(self);
+        if let Err(e) = cacache::index::insert_async(cache, &self.key, opts).await {
+            error!("Error save cache metadata: {}", e);
+        } else {
+            debug!("Save metadata for key: {}, reason: {}", &self.key, reason)
+        }
+    }
 }
 
 /// Convert from cacache
@@ -65,9 +88,61 @@ impl From<&Metadata> for WriteOpts {
 }
 
 
+enum WriterCommand {
+    Write(Metadata, String),    // write metadata to index with reason
+    Exit                        // exit writer 
+}
+
+struct IndexWriter {
+    task: RwLock<Option<JoinHandle<()>>>,
+    tx: mpsc::Sender<WriterCommand>
+}
+
+impl IndexWriter {
+    fn new(path: PathBuf) -> Self {
+        // create index writer channel
+        let (tx, mut rx) = mpsc::channel(5000);      
+        // spawn a async task
+        // task ended when the channel has been closed or Exit command received
+        let task = task::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    WriterCommand::Write(md, reason) => md.save(&path, &reason).await,
+                    WriterCommand::Exit => break
+                }
+            }
+            debug!("Index writer task finished.");
+        });
+        Self { task: RwLock::new(Some(task)), tx }
+    }
+
+    async fn exit(&self) {
+        if let Err(e) = self.tx.send(WriterCommand::Exit).await {
+            // receiver dropped
+            error!("Writer task receiver dropped: {}", e);         
+            return;
+        }
+        if let Some(task) = self.task.write().await.take() {
+            debug!("Waiting for index writer task...");
+            task.await.ok();
+        } else {
+            debug!("Writer task already exited.");
+        }   
+    }
+
+    async fn write(&self, md: Metadata, reason: String) -> Result<(), SendError<WriterCommand>> {
+        self.tx.send(WriterCommand::Write(md, reason)).await
+    }
+
+    fn sender(&self) -> mpsc::Sender<WriterCommand> {
+        self.tx.clone()
+    }
+}
+
 pub struct MetaCache  {
     path: PathBuf,
     cache: Cache<String, Metadata>,
+    writer: IndexWriter,
     _lock: Lockfile
 }
 
@@ -87,51 +162,53 @@ impl MetaCache {
                     )
                 )?
         };
+
+        // create index writer
+        let writer = IndexWriter::new(path.clone());
+
         // create eviction closure
         // eviction will save metadata to index file
-        let cache = path.clone();
+        let tx = writer.sender();
         let listener = 
-            move | key: Arc<String>, md: Metadata, cause: RemovalCause | {
+            move | _key: Arc<String>, md: Metadata, cause: RemovalCause | {
                 // replace only in-memory
                 if cause != RemovalCause::Replaced {
-                    // maybe it already exists?
-                    if let Some(index_md) = cacache::index::find(&cache, &key)
-                            .ok()
-                            .flatten() {
-                        if Metadata::from(index_md) == md {
-                            // already saved, do nothing
-                            info!("Drop metadata for key: {}, reason: {:?}", &key, cause);
-                            return;
-                        }
-                    }
-                    // insert cached metadata to index
-                    let opts = WriteOpts::from(&md);
-                    if let Err(e) = cacache::index::insert(&cache, &key, opts) {
-                        error!("Error commit cache metadata: {}", e);
-                    } else {
-                        info!("Save metadata for key: {}, reason: {:?}", &key, cause)
-                    }
+                    tx.blocking_send(
+                        WriterCommand::Write(md, format!("{:?}", cause)))
+                        .unwrap_or_else(|e| {
+                            error!("Error save cache metadata: {}", e);
+                        })
                 }
             };
+        
         // create cache
         let cache = Cache::builder()
             .max_capacity(capacity)
             .time_to_live(Duration::from_secs(ttl))
             .eviction_listener_with_queued_delivery_mode(listener)
             .build();
+        
         // return cache
         Ok(MetaCache { 
             path, 
             cache,
+            writer,
             _lock: lock
         })
     }
 
-    pub fn save_all(&self) {
-        info!("Start saving metadata to index: {} element(s)...", self.cache.entry_count());
-        self.cache.invalidate_all();
-        self.cache.sync();
-    }     
+    pub async fn shutdown(&self) {
+        info!("Start cache shutdown, saving metadata to index: {} element(s)...", self.cache.entry_count());
+        for (_key, md) in self.cache.iter() {
+            self.writer.write(md, "Shutdown".to_string())
+                .await
+                .unwrap_or_else(|e| {
+                    error!("Error send save command: {}", e);
+                });
+        }
+        self.writer.exit().await;
+        info!("Cache shutdown complete.");
+    }
 
     pub async fn metadata(&self, key: &str) -> Option<Metadata> {
         // make async block for index reading
@@ -218,11 +295,6 @@ impl MetaCache {
     }
 }
 
-impl Drop for MetaCache {
-    fn drop(&mut self) {
-        self.save_all()
-    }
-}
 
 fn now() -> u128 {
     SystemTime::now()

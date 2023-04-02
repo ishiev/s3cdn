@@ -129,8 +129,8 @@ async fn index<'r>(
     ))
 }
 
-#[launch]
-fn rocket() -> _ {
+#[rocket::main]
+async fn main() {
     // set configutation sources
     let figment = Figment::from(rocket::Config::default())
         .merge(Serialized::defaults(Config::default()))
@@ -172,9 +172,24 @@ fn rocket() -> _ {
     // set server base path from config
     let base_path = config.base_path.to_owned();
 
-    rocket::custom(figment)
+    let res = rocket::custom(figment)
         .manage(cache)
         .manage(config)
         .mount(base_path, routes![index])
         .register("/", catchers![default_catcher])
-}
+        .launch()
+        .await;
+
+    match res {
+        Ok(res) => {
+            if let Some(cache) = res.state::<ObjectCache>() {
+                // save cache and exiting
+                cache.shutdown().await;
+                info!("{} terminated.", env!("CARGO_PKG_DESCRIPTION"));
+            } 
+        },
+        Err(e) => {
+            error!("Abnormal termination: {}", e);
+        }
+    }
+ }
