@@ -585,7 +585,7 @@ fn read_stream(
             .await
             .map_err(|e| S3Error::Http(500, e.to_string()))?;
         // read values from cache
-        let mut buf = BytesMut::with_capacity(rocket::response::Body::DEFAULT_MAX_CHUNK);    
+        let mut buf = BytesMut::with_capacity(rocket::response::Body::DEFAULT_MAX_CHUNK * 16);    
         while fd.read_buf(&mut buf).await? > 0 {
             let chunk = buf.split();
             yield chunk.freeze();
