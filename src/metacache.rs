@@ -17,8 +17,10 @@ use moka::{
     Entry
 };
 use ssri::Integrity;
-use tokio::{sync::{mpsc::{self, error::SendError}, RwLock}, task::{self, JoinHandle}};
-
+use tokio::{
+    sync::{mpsc::{self, error::SendError}, RwLock}, 
+    task::{self, JoinHandle}
+};
 
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct Metadata {
@@ -89,7 +91,7 @@ impl From<&Metadata> for WriteOpts {
 
 
 enum WriterCommand {
-    Write(Metadata, String),    // write metadata to index with reason
+    Write(Arc<Metadata>, String),    // write metadata to index with reason
     Exit                        // exit writer 
 }
 
@@ -130,7 +132,7 @@ impl IndexWriter {
         }   
     }
 
-    async fn write(&self, md: Metadata, reason: String) -> Result<(), SendError<WriterCommand>> {
+    async fn write(&self, md: Arc<Metadata>, reason: String) -> Result<(), SendError<WriterCommand>> {
         self.tx.send(WriterCommand::Write(md, reason)).await
     }
 
@@ -141,7 +143,7 @@ impl IndexWriter {
 
 pub struct MetaCache  {
     path: PathBuf,
-    cache: Cache<String, Metadata>,
+    cache: Cache<String, Arc<Metadata>>,
     writer: IndexWriter,
     _lock: Lockfile
 }
@@ -170,7 +172,7 @@ impl MetaCache {
         // eviction will save metadata to index file
         let tx = writer.sender();
         let listener = 
-            move | _key: Arc<String>, md: Metadata, cause: RemovalCause | {
+            move | _key: Arc<String>, md: Arc<Metadata>, cause: RemovalCause | {
                 // replace only in-memory
                 if cause != RemovalCause::Replaced {
                     tx.blocking_send(
@@ -221,13 +223,15 @@ impl MetaCache {
                     None
                 })
                 .map(Metadata::from)
+                .map(Arc::new)
         };
         // find entry in cache or read from index
         self.cache
             .entry_by_ref(key)
             .or_optionally_insert_with(init)
             .await
-            .map(Entry::into_value) 
+            .map(Entry::into_value)
+            .map(|x| x.as_ref().clone())
     }
 
     pub async fn metadata_checked(&self, key: &str) -> Option<cacache::Metadata> {
@@ -263,11 +267,13 @@ impl MetaCache {
     }
 
     pub async fn insert(&self, md: Metadata) {
-        self.cache.insert(md.key.clone(), md).await
+        self.cache.insert(md.key.clone(), Arc::new(md)).await
     }
 
     pub async fn update(&self, md: Metadata) {
-        if let Some(mut item) = self.cache.get(&md.key) {
+        if let Some(mut item) = self.cache
+                .get(&md.key)
+                .map(|x| x.as_ref().clone()) {
             item.integrity = md.integrity.or(item.integrity);
             item.time = md.time.or(item.time);
             item.size = md.size.or(item.size);
