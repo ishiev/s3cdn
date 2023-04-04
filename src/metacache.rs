@@ -1,7 +1,7 @@
 use std::{
     path::{PathBuf, Path}, 
     time::{Duration, SystemTime, UNIX_EPOCH}, 
-    sync::Arc,
+    sync::Arc, borrow::Cow,
 };
 use cacache::{
     WriteOpts, 
@@ -90,7 +90,7 @@ impl From<&Metadata> for WriteOpts {
 }
 
 enum WriterCommand {
-    Write(Arc<Metadata>, String),    // write metadata to index with reason
+    Write(Arc<Metadata>, Cow<'static, str>),    // write metadata to index with reason
     Exit                        // exit writer 
 }
 
@@ -131,7 +131,7 @@ impl IndexWriter {
         }   
     }
 
-    async fn write(&self, md: Arc<Metadata>, reason: String) -> Result<(), SendError<WriterCommand>> {
+    async fn write(&self, md: Arc<Metadata>, reason: Cow<'static, str>) -> Result<(), SendError<WriterCommand>> {
         self.tx.send(WriterCommand::Write(md, reason)).await
     }
 
@@ -175,7 +175,7 @@ impl MetaCache {
                 // replace only in-memory
                 if cause != RemovalCause::Replaced {
                     tx.blocking_send(
-                        WriterCommand::Write(md, format!("{:?}", cause)))
+                        WriterCommand::Write(md, Cow::from(format!("{:?}", cause))))
                         .unwrap_or_else(|e| {
                             error!("Error save cache metadata: {}", e);
                         })
@@ -201,7 +201,7 @@ impl MetaCache {
     pub async fn shutdown(&self) {
         info!("Start cache shutdown, saving metadata to index: {} element(s)...", self.cache.entry_count());
         for (_key, md) in self.cache.iter() {
-            self.writer.write(md, "Shutdown".to_string())
+            self.writer.write(md, Cow::from("Shutdown"))
                 .await
                 .unwrap_or_else(|e| {
                     error!("Error send save command: {}", e);
