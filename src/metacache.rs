@@ -46,7 +46,7 @@ impl Metadata {
             if Metadata::from(index_md) == *self {
                 // already saved, do nothing
                 debug!("Drop metadata for key: {}, reason: {}", &self.key, reason);
-                return;
+                return
             }
         }
         // insert to index
@@ -89,7 +89,6 @@ impl From<&Metadata> for WriteOpts {
     }
 }
 
-
 enum WriterCommand {
     Write(Arc<Metadata>, String),    // write metadata to index with reason
     Exit                        // exit writer 
@@ -122,7 +121,7 @@ impl IndexWriter {
         if let Err(e) = self.tx.send(WriterCommand::Exit).await {
             // receiver dropped
             error!("Writer task receiver dropped: {}", e);         
-            return;
+            return
         }
         if let Some(task) = self.task.write().await.take() {
             debug!("Waiting for index writer task...");
@@ -246,16 +245,11 @@ impl MetaCache {
                         metadata: md.metadata,
                         raw_metadata: None,
                     };
-                    Some(md)
-                } else {
-                    None
-                }
-            } else {
-                None
+                    return Some(md)
+                } 
             }
-        } else {
-            None
         }
+        None
     }
 
     pub async fn exists(&self, sri: &Integrity) -> bool {

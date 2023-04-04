@@ -266,47 +266,44 @@ impl ValidationResult {
 pub struct ObjectCache {
     config: ConfigObjectCache,
     headers: HeaderMap<'static>,
-    mc: Arc<MetaCache>,
+    mc: Option<Arc<MetaCache>>,
 }
 
 impl ObjectCache {
     /// Create from config
     pub fn new(mut config: ConfigObjectCache) -> Result<Self, S3Error> {
-        let path = config.root
-            .take()
-            .or_else(|| {
-                if config.mode == CacheMode::Internal {
-                    None
-                } else {
-                    // default, but must be neither used
-                    Some(PathBuf::from("cache-data"))
-                }
-            })
-            .ok_or(S3Error::Http(500, "Cache root config param not defined!".to_string()))?;
+        // create metacache only in internal cache mode
+        let mc = {
+            if config.mode == CacheMode::Internal {
+                // path for cache storage
+                let path = config.root
+                    .take()
+                    .ok_or(S3Error::Http(500, "Cache root config param not defined!".to_string()))?;           
+                // ttl for cache items 
+                let ttl = max(
+                    config.max_age.unwrap_or_default(), 
+                    config.index_checkpoint.unwrap_or(3600*24)
+                );
+                Some(Arc::new(
+                    MetaCache::new(path, ttl, 500_000)
+                        .map_err(|e| S3Error::Http(500, format!("Cache create error: {}", e)))?
+                ))
+            } else {
+                None
+            }
+        }; 
         // cache-control headers
-        let headers = config.make_headers();
-        // ttl for cache items 
-        let ttl = max(
-            config.max_age.unwrap_or_default(), 
-            config.index_checkpoint.unwrap_or(3600*24)
-        );
+        let headers = config.make_headers();      
         Ok(Self {
             config,
             headers,
-            mc: Arc::new(
-                MetaCache::new(path, ttl, 500_000)
-                    .map_err(|e| S3Error::Http(500, format!("Cache create error: {}", e)))?
-                )
+            mc
         })
     }
 
     /// Get cache-control headers for response
     pub fn headers(&self) -> HeaderMap<'static> {
         self.headers.to_owned()
-    }
-
-    pub fn mode(&self) -> CacheMode {
-        self.config.mode
     }
 
     /// Get object from cache or from origin source, bypass if mode != Internal
@@ -317,26 +314,19 @@ impl ObjectCache {
         F: FnOnce(ConditionalHeaders<'a>)->Fut,
         Fut: Future<Output = Result<DataObject, S3Error>>
     {
-        if self.mode() == CacheMode::Internal {
-            self.get_cached_object(key, origin, condition).await
-        } else {
-            origin(condition).await
-        }
-    }
-
-    /// Get object from cache or from origin source
-    pub async fn get_cached_object<'a, K, F, Fut>(&self, key: K, origin: F, condition: ConditionalHeaders<'a>) 
-    -> Result<DataObject, S3Error> 
-    where 
-        K: AsRef<ObjectKey<'a>> + std::marker::Copy,
-        F: FnOnce(ConditionalHeaders<'a>)->Fut,
-        Fut: Future<Output = Result<DataObject, S3Error>>
-    {
+        let mc = match self.mc {
+            Some(ref mc) => mc,
+            None => {
+                // no cache, short circuit to origin 
+                return origin(condition).await
+            }
+        };
+                
         // make cache item key
         let key = key.as_ref().cache_key();
         
         // try to get object from cache
-        let (obj, sri) = try_get_object(Arc::clone(&self.mc), &key)
+        let (obj, sri) = try_get_object(Arc::clone(mc), &key)
             .await? 
             .map_or((None, None), |(obj, sri)| (Some(obj), Some(sri)));
         
@@ -350,7 +340,7 @@ impl ObjectCache {
                 // got new object from origin
                 // save stream to cache
                 let stream = save_stream(
-                    Arc::clone(&self.mc), 
+                    Arc::clone(mc), 
                     key, 
                     obj.stream, 
                     &obj.meta
@@ -379,7 +369,7 @@ impl ObjectCache {
                     metadata: json!(obj.meta),
                     ..Default::default()
                 };
-                self.mc.update(md).await;
+                mc.update(md).await;
                 // return from cache
                 check_condition(obj, condition)
             },
@@ -388,12 +378,12 @@ impl ObjectCache {
                 // remove old object from cache
                 let sri = sri
                     .ok_or(S3Error::Http(500, "Error get sri while updating object in cache".to_string()))?;
-                self.mc.remove_hash(&sri)
+                mc.remove_hash(&sri)
                     .await
                     .map_err(|e| S3Error::Http(500,format!("Error remove object: {e}")))?;
                 // save new object to cache
                 let stream = save_stream(
-                    Arc::clone(&self.mc), 
+                    Arc::clone(mc), 
                     key, 
                     obj.stream, 
                     &obj.meta
@@ -416,7 +406,7 @@ impl ObjectCache {
                 // remove object from cache
                 let sri = sri
                     .ok_or(S3Error::Http(500, "Error get sri while removing object from cache".to_string()))?;
-                self.mc.remove_hash(&sri)
+                mc.remove_hash(&sri)
                     .await
                     .map_err(|e| S3Error::Http(500,format!("Error remove object: {e}")))?;
                 // return error
@@ -479,7 +469,9 @@ impl ObjectCache {
     }
 
     pub async fn shutdown(&self) {
-        self.mc.shutdown().await;
+        if let Some(ref mc) = self.mc {
+            mc.shutdown().await;        
+        }
     }
 }
 
