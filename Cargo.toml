@@ -24,6 +24,9 @@ time = "0.3"
 moka = { version = "0.10", features = ["future"] }
 lockfile = "0.4"
 
+[dev-dependencies]
+rand = "0.8"
+
 [patch."https://github.com/ishiev/rust-s3.git"]
 rust-s3 = { path = "../rust-s3/s3" }
 

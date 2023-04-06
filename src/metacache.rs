@@ -94,6 +94,7 @@ enum WriterCommand {
     Exit                        // exit writer 
 }
 
+#[derive(Debug)]
 struct IndexWriter {
     task: RwLock<Option<JoinHandle<()>>>,
     tx: mpsc::Sender<WriterCommand>
@@ -140,6 +141,7 @@ impl IndexWriter {
     }
 }
 
+#[derive(Debug)]
 pub struct MetaCache  {
     path: PathBuf,
     cache: Cache<String, Arc<Metadata>>,
@@ -301,4 +303,67 @@ fn now() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis()
+}
+
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use rand::{
+        Rng, 
+        distributions::Uniform
+    };
+    use serde_json::json;
+    use tokio::time::Instant;
+
+    fn gen_rand_vec(size: usize) -> Vec<u8> {
+        let mut rng = rand::thread_rng();
+        let range = Uniform::new(0, 255);
+
+        (0..size).map(|_| rng.sample(range)).collect()
+    }
+
+    fn gen_metadata(key: String) -> Metadata {
+        Metadata { 
+            integrity: Some(Integrity::from(&key)),
+            time: Some(now()),
+            size: Some(key.len()),
+            metadata: json!(key),
+            key
+        }
+    }
+
+    #[tokio::test]
+    async fn fail_double_create() {
+        let path = PathBuf::from("./test-data/metacache-1");
+        
+        // only one must be allowed
+        let _mc1 = MetaCache::new(path.clone(), 10, 1000).unwrap();
+        let _mc2 = MetaCache::new(path, 10, 1000).expect_err("Second MetaCache created");
+    }
+
+    #[tokio::test]
+    async fn metacache_insert() {
+        let path = PathBuf::from("./test-data/metacache-2");
+        let mc = Arc::new(MetaCache::new(path.clone(), 10, 10000).unwrap());
+        // async tasks for inserts
+        let tasks: Vec<JoinHandle<()>> = (0..10000)
+            .map(|x| {
+                let mc = Arc::clone(&mc);
+                task::spawn(async move {
+                    mc.insert(gen_metadata(format!("key {}", x))).await
+                })
+            })
+            .collect();
+
+        // complete all
+        for h in tasks {
+            let _ = h.await;
+        }
+
+        println!("start saving cache to index...");
+        let t0 = Instant::now();
+        mc.shutdown().await;
+        println!(">> complete in {:.2}s", t0.elapsed().as_secs_f32());
+    }
 }
