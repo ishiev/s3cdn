@@ -1,6 +1,6 @@
 use std::{
     path::{PathBuf, Path}, 
-    time::{Duration, SystemTime, UNIX_EPOCH}, 
+    time::{SystemTime, UNIX_EPOCH}, 
     sync::Arc, borrow::Cow,
 };
 use cacache::{
@@ -150,7 +150,7 @@ pub struct MetaCache  {
 }
 
 impl MetaCache {
-    pub fn new(path: PathBuf, ttl: u64, capacity: u64) -> Result<Self, Error> {
+    pub fn new(path: PathBuf, capacity: u64) -> Result<Self, Error> {
         // try to lock cache path
         let lock = {
             let mut lockfile = PathBuf::from(&path);
@@ -187,7 +187,6 @@ impl MetaCache {
         // create cache
         let cache = Cache::builder()
             .max_capacity(capacity)
-            .time_to_live(Duration::from_secs(ttl))
             .eviction_listener_with_queued_delivery_mode(listener)
             .build();
         
@@ -338,20 +337,33 @@ mod test {
         let path = PathBuf::from("./test-data/metacache-1");
         
         // only one must be allowed
-        let _mc1 = MetaCache::new(path.clone(), 10, 1000).unwrap();
-        let _mc2 = MetaCache::new(path, 10, 1000).expect_err("Second MetaCache created");
+        let _mc1 = MetaCache::new(path.clone(), 1000).unwrap();
+        let _mc2 = MetaCache::new(path, 1000).expect_err("Second MetaCache created");
     }
 
     #[tokio::test]
     async fn metacache_insert() {
+        const ITEMS: usize = 10_000;
         let path = PathBuf::from("./test-data/metacache-2");
-        let mc = Arc::new(MetaCache::new(path.clone(), 10, 10000).unwrap());
+        let mc = Arc::new(MetaCache::new(path.clone(), ITEMS as u64).unwrap());
+
+        let keys: Vec<String> = (0..ITEMS)
+            .map(|x| format!("key {x}"))
+            .collect();
+        
+        let md1: Vec<Metadata> = keys
+            .iter()
+            .map(|x| gen_metadata(x.clone()))
+            .collect();
+
         // async tasks for inserts
-        let tasks: Vec<JoinHandle<()>> = (0..10000)
+        let tasks: Vec<JoinHandle<()>> = md1
+            .iter()
             .map(|x| {
                 let mc = Arc::clone(&mc);
+                let md = x.clone();
                 task::spawn(async move {
-                    mc.insert(gen_metadata(format!("key {}", x))).await
+                    mc.insert(md).await
                 })
             })
             .collect();
@@ -361,9 +373,21 @@ mod test {
             let _ = h.await;
         }
 
+        // saving to index
         println!("start saving cache to index...");
         let t0 = Instant::now();
         mc.shutdown().await;
         println!(">> complete in {:.2}s", t0.elapsed().as_secs_f32());
+
+        // we can get it back
+        println!("start reading cache from index...");
+        let t1 = Instant::now();
+        let mut md2: Vec<Metadata> = Vec::with_capacity(ITEMS);
+        for x in keys.iter() {
+            md2.push(mc.metadata(x.as_str()).await.unwrap());
+        }
+        println!(">> complete in {:.2}s", t1.elapsed().as_secs_f32());
+
+        assert_eq!(md1, md2);
     }
 }
