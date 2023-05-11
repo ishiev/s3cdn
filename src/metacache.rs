@@ -309,7 +309,7 @@ impl MetaCache {
             if !md.metadata.is_null() {
                 item.metadata = md.metadata
             }
-            item.is_fresh = md.is_fresh;
+            item.is_fresh = None;   // this field is never saved
             self.insert(item).await
         }
     }
