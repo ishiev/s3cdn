@@ -14,7 +14,6 @@ use lockfile::Lockfile;
 use moka::{
     future::Cache, 
     notification::RemovalCause, 
-    Entry
 };
 use ssri::Integrity;
 use tokio::{
@@ -34,9 +33,21 @@ pub struct Metadata {
     pub size: Option<usize>,
     // arbitrary JSON  associated with this entry
     pub metadata: Value,
+    // metadata cache status: 
+    // Some(true) - read from index file, Some(false) - got from cache, maybe outdated,
+    // None - no status information
+    pub is_fresh: Option<bool>,  
 }
 
 impl Metadata {
+    /// Read metadata from index file
+    async fn read(cache: &Path, key: &str) -> Result<Option<Self>, Error> {
+        let md = cacache::index::find_async(cache, key)
+            .await?
+            .map(Metadata::from);
+        Ok(md)
+    }
+
     /// Save metadata to index file
     async fn save(&self, cache: &Path, reason: &str) {
         // maybe it already exists?
@@ -68,6 +79,7 @@ impl From<cacache::Metadata> for Metadata {
             time: if md.time == 0 { None } else { Some(md.time) },
             size: if md.size == 0 { None } else { Some(md.size) },
             metadata: md.metadata,
+            is_fresh: None
         }
     }
 }
@@ -154,6 +166,7 @@ impl MetaCache {
         // try to lock cache path
         let lock = {
             let mut lockfile = PathBuf::from(&path);
+            lockfile.push("lockdir");
             lockfile.push(".lockfile");
             // create lockfile with all parents dir
             Lockfile::create_with_parents(lockfile)
@@ -216,13 +229,12 @@ impl MetaCache {
         // make async block for index reading
         // return None if reading error
         let init = async {
-            cacache::index::find_async(&self.path, key)
+            Metadata::read(&self.path, key)
                 .await
                 .unwrap_or_else(|e| {
                     error!("Error read index: {}", e);
                     None
                 })
-                .map(Metadata::from)
                 .map(Arc::new)
         };
         // find entry in cache or read from index
@@ -230,27 +242,49 @@ impl MetaCache {
             .entry_by_ref(key)
             .or_optionally_insert_with(init)
             .await
-            .map(Entry::into_value)
-            .map(|x| x.as_ref().clone())
+            .map(|x| {
+                let mut md = x.value().as_ref().clone();
+                md.is_fresh = Some(x.is_fresh());
+                md
+            })
     }
 
+    #[async_recursion::async_recursion]
     pub async fn metadata_checked(&self, key: &str) -> Option<cacache::Metadata> {
-        if let Some(md) = self.metadata(key).await {
-            if let Some(sri) = md.integrity {
-                if self.exists(&sri).await {
-                    let md = cacache::Metadata {
-                        key: md.key,
-                        integrity: sri,
-                        time: md.time.unwrap_or_default(),
-                        size: md.size.unwrap_or_default(),
-                        metadata: md.metadata,
-                        raw_metadata: None,
-                    };
-                    return Some(md)
-                } 
+        // get metadata from cache 
+        let Some(md) = self.metadata(key).await 
+        else { return None };
+
+        // make async block for second chance check (recursion!)
+        let check_fresh = || async {
+            if md.is_fresh == Some(false) {
+                // metadata got from cache and may be outdated,
+                // remove it from cache and try to get from index file
+                self.cache.invalidate(key).await;
+                self.metadata_checked(key).await
+            } else {
+                None
             }
+        };
+        
+        // check for sri
+        let Some(sri) = md.integrity 
+        else { return check_fresh().await };
+
+        // check for data file
+        if self.exists(&sri).await {
+            let md = cacache::Metadata {
+                key: md.key,
+                integrity: sri,
+                time: md.time.unwrap_or_default(),
+                size: md.size.unwrap_or_default(),
+                metadata: md.metadata,
+                raw_metadata: None,
+            };
+            Some(md)
+        } else  {
+            check_fresh().await
         }
-        None
     }
 
     pub async fn exists(&self, sri: &Integrity) -> bool {
@@ -275,6 +309,7 @@ impl MetaCache {
             if !md.metadata.is_null() {
                 item.metadata = md.metadata
             }
+            item.is_fresh = md.is_fresh;
             self.insert(item).await
         }
     }
@@ -315,6 +350,7 @@ mod test {
     use serde_json::json;
     use tokio::time::Instant;
 
+    #[allow(dead_code)]
     fn gen_rand_vec(size: usize) -> Vec<u8> {
         let mut rng = rand::thread_rng();
         let range = Uniform::new(0, 255);
@@ -328,6 +364,7 @@ mod test {
             time: Some(now()),
             size: Some(key.len()),
             metadata: json!(key),
+            is_fresh: Some(false),  // from cache
             key
         }
     }

@@ -23,6 +23,7 @@ cacache = { version = "*", default-features = false, features = ["tokio-runtime"
 time = "0.3"
 moka = { version = "0.10", features = ["future"] }
 lockfile = "0.4"
+async-recursion = "1"
 
 [dev-dependencies]
 rand = "0.8"

@@ -534,10 +534,9 @@ fn save_stream<K: AsRef<str>>(
     // create metadata for write stream
     let md = Metadata {
         key: String::from(key.as_ref()),
-        integrity: None,  // will be added at commit
-        time: None,       // will be added at commit
         size: meta.content_length,
-        metadata: json!{meta}
+        metadata: json!{meta},
+        ..Default::default()
     };
     let stream = try_stream! {
         // create writer for store stream in cache
@@ -664,10 +663,6 @@ mod test {
             data
         };
       
-        // uncomment to pause to manually edit the cache file and cause the integrity check to fail
-        // press Enter in terminal to continue
-        pause().await;
-
         // get stream from cache
         let md = cacache::metadata(dir, &key).await.unwrap().unwrap();
         let sri = md.integrity;
