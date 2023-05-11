@@ -33,13 +33,22 @@ pub struct Metadata {
     pub size: Option<usize>,
     // arbitrary JSON  associated with this entry
     pub metadata: Value,
-    // metadata cache status: 
-    // Some(true) - read from index file, Some(false) - got from cache, maybe outdated,
-    // None - no status information
-    pub is_fresh: Option<bool>,  
+
+    // private metadata cache status (used in metadata_checked): 
+    // Some(true) - metadata from index file, Some(false) - metadata from cache and maybe outdated,
+    // None - no status information (default)
+    is_fresh: Option<bool>,  
 }
 
 impl Metadata {
+    /// Create from string key
+    pub fn new(key: String) -> Self {
+        Metadata { 
+            key,
+            ..Default::default()
+        }
+    }
+
     /// Read metadata from index file
     async fn read(cache: &Path, key: &str) -> Result<Option<Self>, Error> {
         let md = cacache::index::find_async(cache, key)

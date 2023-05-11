@@ -361,11 +361,8 @@ impl ObjectCache {
                 obj.meta.date = Some(SystemTime::now());
                 obj.status = Some(status);  
                 // make metadata for update
-                let md = Metadata {
-                    key,
-                    metadata: json!(obj.meta),
-                    ..Default::default()
-                };
+                let mut md = Metadata::new(key);
+                md.metadata = json!(obj.meta);
                 mc.update(md).await;
                 // return from cache
                 check_condition(obj, condition)
@@ -531,13 +528,11 @@ fn save_stream<K: AsRef<str>>(
     input: DataStream,
     meta: &ObjectMeta
 ) -> DataStream {
-    // create metadata for write stream
-    let md = Metadata {
-        key: String::from(key.as_ref()),
-        size: meta.content_length,
-        metadata: json!{meta},
-        ..Default::default()
-    };
+    // create metadata info for stream
+    let mut md = Metadata::new(String::from(key.as_ref()));
+    md.size = meta.content_length; // for check actual written size in commit
+    md.metadata = json!{meta};
+
     let stream = try_stream! {
         // create writer for store stream in cache
         let mut fd = mc.writer(&md)
