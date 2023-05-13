@@ -291,7 +291,7 @@ impl MetaCache {
                 raw_metadata: None,
             };
             Some(md)
-        } else  {
+        } else {
             check_fresh().await
         }
     }
@@ -327,6 +327,7 @@ impl MetaCache {
         WriteOpts::from(md).open(&self.path, &md.key).await
     }
 
+    // TODO: may be remove? useless in cluster mode!
     pub async fn commit(&self, mut md: Metadata, writer: Writer) -> Result<Integrity, Error> {
         let sri = writer.commit().await?;
         md.integrity = Some(sri.clone());
@@ -357,7 +358,7 @@ mod test {
         distributions::Uniform
     };
     use serde_json::json;
-    use tokio::time::Instant;
+    use tokio::{time::Instant, io::{AsyncWriteExt, AsyncReadExt}};
 
     #[allow(dead_code)]
     fn gen_rand_vec(size: usize) -> Vec<u8> {
@@ -388,7 +389,8 @@ mod test {
     }
 
     #[tokio::test]
-    async fn metacache_insert() {
+    /// Test index write/read performance
+    async fn metacache_insert_perf() {
         const ITEMS: usize = 10_000;
         let path = PathBuf::from("./test-data/metacache-2");
         let mc = Arc::new(MetaCache::new(path.clone(), ITEMS as u64).unwrap());
@@ -423,17 +425,61 @@ mod test {
         println!("start saving cache to index...");
         let t0 = Instant::now();
         mc.shutdown().await;
-        println!(">> complete in {:.2}s", t0.elapsed().as_secs_f32());
+        let t_write = t0.elapsed().as_secs_f32();
+        println!(">> complete in {:.2}s", t_write);
+        assert!(t_write < 20.0);
 
-        // we can get it back
+        // now we can get it back
         println!("start reading cache from index...");
-        let t1 = Instant::now();
+        let t0 = Instant::now();
         let mut md2: Vec<Metadata> = Vec::with_capacity(ITEMS);
         for x in keys.iter() {
             md2.push(mc.metadata(x.as_str()).await.unwrap());
         }
-        println!(">> complete in {:.2}s", t1.elapsed().as_secs_f32());
+        let t_read = t0.elapsed().as_secs_f32();
+        println!(">> complete in {:.2}s", t_read);
+        assert!(t_read < 20.0);
 
         assert_eq!(md1, md2);
+    }
+
+    #[tokio::test]
+    /// Check for metadata after index file update
+    async fn check_index_update() {
+        let path = PathBuf::from("./test-data/metacache-3");
+        let mc = MetaCache::new(path.clone(), 10).unwrap();
+        let key = "MyData".to_string();
+        let test_data_1 = "My test data".as_bytes();
+        let test_data_2 = "My another test data".as_bytes();
+
+        // write some data to cache
+        let md = Metadata::new(key.clone());
+        let mut writer = mc.writer(&md).await.unwrap();
+        writer.write_all(test_data_1).await.unwrap();
+        writer.commit().await.unwrap();  // direct use writer commit!
+
+        // test_1: get back data
+        let md1 = mc.metadata_checked(&key).await.unwrap();
+        let mut reader = mc.reader(md1.integrity.clone()).await.unwrap();
+        let mut result = Vec::<u8>::new();
+        reader.read_to_end(&mut result).await.unwrap();
+        assert_eq!(test_data_1, result);
+
+        // delete data to force refresh metacache !!!
+        mc.remove_hash(&md1.integrity).await.unwrap();
+
+        // rewrite data in the same key
+        let mut writer = mc.writer(&md).await.unwrap();
+        writer.write_all(test_data_2).await.unwrap();
+        writer.commit().await.unwrap();  // direct use writer commit!
+
+        // test_2: get back new metadata and new data
+        let md2 = mc.metadata_checked(&key).await.unwrap();
+        assert_ne!(md1, md2);
+        let mut reader = mc.reader(md2.integrity).await.unwrap();
+        let mut result = Vec::<u8>::new();
+        reader.read_to_end(&mut result).await.unwrap();
+        assert_eq!(test_data_2, result);
+
     }
 }

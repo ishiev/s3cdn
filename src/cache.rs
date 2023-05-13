@@ -605,7 +605,7 @@ mod test {
 
     #[tokio::test]
     async fn double_write_cache() {
-        let dir = "./tests/my-cache1";
+        let dir = "./test-data/cache-1";
         let key = "my key";
 
         // write some data
@@ -623,7 +623,7 @@ mod test {
 
     #[tokio::test]
     async fn cache_stream() {
-        let dir = "./tests/my-cache2";
+        let dir = "./test-data/cache-2";
         let key = ObjectKey {
             bucket: "bucket1",
             key: Path::new("my key")
