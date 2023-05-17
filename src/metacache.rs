@@ -1,7 +1,8 @@
 use std::{
     path::{PathBuf, Path}, 
-    time::{SystemTime, UNIX_EPOCH}, 
-    sync::Arc, borrow::Cow,
+    time::SystemTime, 
+    sync::Arc, 
+    borrow::Cow,
 };
 use cacache::{
     WriteOpts, 
@@ -10,7 +11,6 @@ use cacache::{
     Writer,
     Error,
 };
-use lockfile::Lockfile;
 use moka::{
     future::Cache, 
     notification::RemovalCause, 
@@ -20,6 +20,28 @@ use tokio::{
     sync::{mpsc::{self, error::SendError}, RwLock}, 
     task::{self, JoinHandle}
 };
+use sha1::{Sha1, Digest};
+
+/// Cacache index version
+const INDEX_VERSION: &str = "5";
+
+/// Index file metadata
+#[derive(Debug, Clone, PartialEq)]
+struct IndexMeta {
+    // file size in bytes
+    len: u64,
+    // file last modified time
+    modified: Option<SystemTime>
+}
+
+impl From<std::fs::Metadata> for IndexMeta {
+    fn from(value: std::fs::Metadata) -> Self {
+        Self { 
+            len: value.len(),
+            modified: value.modified().ok()
+        }
+    }
+} 
 
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct Metadata {
@@ -33,11 +55,8 @@ pub struct Metadata {
     pub size: Option<usize>,
     // arbitrary JSON  associated with this entry
     pub metadata: Value,
-
-    // private metadata cache status (used in metadata_checked): 
-    // Some(true) - metadata from index file, Some(false) - metadata from cache and maybe outdated,
-    // None - no status information (default)
-    is_fresh: Option<bool>,  
+    // index file metadata (private field for internal use)
+    index_meta: Option<IndexMeta>,
 }
 
 impl Metadata {
@@ -51,21 +70,36 @@ impl Metadata {
 
     /// Read metadata from index file
     async fn read(cache: &Path, key: &str) -> Result<Option<Self>, Error> {
+        // get index file metadata
+        let index_meta = index_meta(cache, key)
+            .await
+            .map_err(|e| Error::IoError(e, "Error reading metadata".to_string()))?;
+        // read index file 
         let md = cacache::index::find_async(cache, key)
             .await?
-            .map(Metadata::from);
+            .map(|x| {
+                let mut md = Metadata::from(x);
+                md.index_meta = Some(index_meta);
+                md
+            });
         Ok(md)
     }
 
     /// Save metadata to index file
     async fn save(&self, cache: &Path, reason: &str) {
-        // maybe it already exists?
+        // maybe already saved?
         if let Some(index_md) = cacache::index::find_async(cache, &self.key).await
                 .ok()
                 .flatten() {
-            if Metadata::from(index_md) == *self {
+            let mut md = Metadata::from(index_md);
+            md.index_meta = index_meta(cache, &self.key).await.ok();
+            if md == *self {
                 // already saved, do nothing
-                debug!("Drop metadata for key: {}, reason: {}", &self.key, reason);
+                debug!("Drop metadata for key: {} (already saved), reason: {}", &self.key, reason);
+                return
+            } else if Some(md.time) > Some(self.time) {
+                // saved medatada is newer than our, do nothing
+                debug!("Drop metadata for key: {} (older than saved), reason: {}", &self.key, reason);
                 return
             }
         }
@@ -88,7 +122,7 @@ impl From<cacache::Metadata> for Metadata {
             time: if md.time == 0 { None } else { Some(md.time) },
             size: if md.size == 0 { None } else { Some(md.size) },
             metadata: md.metadata,
-            is_fresh: None
+            index_meta: None
         }
     }
 }
@@ -112,7 +146,7 @@ impl From<&Metadata> for WriteOpts {
 
 enum WriterCommand {
     Write(Arc<Metadata>, Cow<'static, str>),    // write metadata to index with reason
-    Exit                        // exit writer 
+    Exit                                        // exit writer 
 }
 
 #[derive(Debug)]
@@ -167,27 +201,10 @@ pub struct MetaCache  {
     path: PathBuf,
     cache: Cache<String, Arc<Metadata>>,
     writer: IndexWriter,
-    _lock: Lockfile
 }
 
 impl MetaCache {
     pub fn new(path: PathBuf, capacity: u64) -> Result<Self, Error> {
-        // try to lock cache path
-        let lock = {
-            let mut lockfile = PathBuf::from(&path);
-            lockfile.push("lockdir");
-            lockfile.push(".lockfile");
-            // create lockfile with all parents dir
-            Lockfile::create_with_parents(lockfile)
-                .map_err(|e| 
-                    Error::IoError(
-                        e.into_inner(), 
-                        format!("Cannot lock cache directory: {:?}. \
-                                Maybe another process is already running?", &path)
-                    )
-                )?
-        };
-
         // create index writer
         let writer = IndexWriter::new(path.clone());
 
@@ -217,7 +234,6 @@ impl MetaCache {
             path, 
             cache,
             writer,
-            _lock: lock
         })
     }
 
@@ -237,7 +253,7 @@ impl MetaCache {
     pub async fn metadata(&self, key: &str) -> Option<Metadata> {
         // make async block for index reading
         // return None if reading error
-        let init = async {
+        let init = || async {
             Metadata::read(&self.path, key)
                 .await
                 .unwrap_or_else(|e| {
@@ -247,39 +263,33 @@ impl MetaCache {
                 .map(Arc::new)
         };
         // find entry in cache or read from index
-        self.cache
+        let entry = self.cache
             .entry_by_ref(key)
-            .or_optionally_insert_with(init)
-            .await
-            .map(|x| {
-                let mut md = x.value().as_ref().clone();
-                md.is_fresh = Some(x.is_fresh());
-                md
-            })
+            .or_optionally_insert_with(init())
+            .await?;     
+        
+        let md = entry.value().as_ref().clone();
+        //  return value if entry is fresh (just readed from index)
+        if entry.is_fresh() {
+            return Some(md)
+        }
+        // check index file if entry not fresh
+        let index_meta = index_meta(&self.path, key).await.ok();
+        if index_meta == md.index_meta {
+            Some(md)
+        } else {
+            // read metadata from index file
+            let index_md = init().await?;
+            self.cache.insert(index_md.key.clone(), Arc::clone(&index_md)).await;
+            Some(index_md.as_ref().clone())
+        }       
     }
 
-    #[async_recursion::async_recursion]
     pub async fn metadata_checked(&self, key: &str) -> Option<cacache::Metadata> {
         // get metadata from cache 
-        let Some(md) = self.metadata(key).await 
-        else { return None };
-
-        // make async block for second chance check (recursion!)
-        let check_fresh = || async {
-            if md.is_fresh == Some(false) {
-                // metadata got from cache and may be outdated,
-                // remove it from cache and try to get from index file
-                self.cache.invalidate(key).await;
-                self.metadata_checked(key).await
-            } else {
-                None
-            }
-        };
-        
+        let md = self.metadata(key).await?;    
         // check for sri
-        let Some(sri) = md.integrity 
-        else { return check_fresh().await };
-
+        let sri = md.integrity?;
         // check for data file
         if self.exists(&sri).await {
             let md = cacache::Metadata {
@@ -292,7 +302,7 @@ impl MetaCache {
             };
             Some(md)
         } else {
-            check_fresh().await
+            None
         }
     }
 
@@ -304,7 +314,7 @@ impl MetaCache {
         cacache::remove_hash(&self.path, sri).await
     }
 
-    pub async fn insert(&self, md: Metadata) {
+    pub async fn insert_local(&self, md: Metadata) {
         self.cache.insert(md.key.clone(), Arc::new(md)).await
     }
 
@@ -318,8 +328,7 @@ impl MetaCache {
             if !md.metadata.is_null() {
                 item.metadata = md.metadata
             }
-            item.is_fresh = None;   // this field is never saved
-            self.insert(item).await
+            self.insert_local(item).await
         }
     }
 
@@ -327,27 +336,34 @@ impl MetaCache {
         WriteOpts::from(md).open(&self.path, &md.key).await
     }
 
-    // TODO: may be remove? useless in cluster mode!
-    pub async fn commit(&self, mut md: Metadata, writer: Writer) -> Result<Integrity, Error> {
-        let sri = writer.commit().await?;
-        md.integrity = Some(sri.clone());
-        md.time = if md.time.is_none() { Some(now()) } else { md.time} ;
-        self.insert(md).await;
-        Ok(sri)
-    }
-
     pub async fn reader(&self, sri: Integrity) -> Result<Reader, Error> {
         Reader::open_hash(&self.path, sri).await
     }
 }
 
-
-fn now() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis()
+/// From cacache::index
+fn bucket_path(cache: &Path, key: &str) -> PathBuf {
+    let hashed = hash_key(key);
+    cache
+        .join(format!("index-v{INDEX_VERSION}"))
+        .join(&hashed[0..2])
+        .join(&hashed[2..4])
+        .join(&hashed[4..])
 }
+
+/// From cacache::index
+fn hash_key(key: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(key);
+    hex::encode(hasher.finalize())
+}
+
+/// Index file metadata
+async fn index_meta(cache: &Path, key: &str) -> std::io::Result<IndexMeta> {
+    tokio::fs::metadata(bucket_path(cache, key))
+        .await
+        .map(IndexMeta::from)
+} 
 
 
 #[cfg(test)]
@@ -368,24 +384,45 @@ mod test {
         (0..size).map(|_| rng.sample(range)).collect()
     }
 
+    fn now() -> u128 {
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    }
+
     fn gen_metadata(key: String) -> Metadata {
         Metadata { 
             integrity: Some(Integrity::from(&key)),
             time: Some(now()),
             size: Some(key.len()),
             metadata: json!(key),
-            is_fresh: Some(false),  // from cache
+            index_meta: None,
             key
         }
     }
 
     #[tokio::test]
-    async fn fail_double_create() {
+    async fn double_instance() {
         let path = PathBuf::from("./test-data/metacache-1");
+        let key = "MyData".to_string();
+        let test_data = "My test data".as_bytes();
+
+        // write some data to cache instrance 1
+        let mc1 = MetaCache::new(path.clone(), 1000).unwrap();
+        let md1 = Metadata::new(key.clone());
+        let mut writer = mc1.writer(&md1).await.unwrap();
+        writer.write_all(test_data).await.unwrap();
+        writer.commit().await.unwrap();
         
-        // only one must be allowed
-        let _mc1 = MetaCache::new(path.clone(), 1000).unwrap();
-        let _mc2 = MetaCache::new(path, 1000).expect_err("Second MetaCache created");
+        // read data from cache instance 2
+        let mc2 = MetaCache::new(path, 1000).unwrap();
+        let md2 = mc2.metadata_checked(&key).await.unwrap();
+        let mut reader = mc2.reader(md2.integrity).await.unwrap();
+        let mut result = Vec::<u8>::new();
+        reader.read_to_end(&mut result).await.unwrap();
+
+        assert_eq!(test_data, result)
     }
 
     #[tokio::test]
@@ -411,7 +448,7 @@ mod test {
                 let mc = Arc::clone(&mc);
                 let md = x.clone();
                 task::spawn(async move {
-                    mc.insert(md).await
+                    mc.insert_local(md).await
                 })
             })
             .collect();
@@ -434,7 +471,12 @@ mod test {
         let t0 = Instant::now();
         let mut md2: Vec<Metadata> = Vec::with_capacity(ITEMS);
         for x in keys.iter() {
-            md2.push(mc.metadata(x.as_str()).await.unwrap());
+            md2.push(async {
+                let mut md = mc.metadata(x.as_str()).await.unwrap();
+                // erase index file meta to correct compare vectors
+                md.index_meta = None;
+                md
+            }.await);
         }
         let t_read = t0.elapsed().as_secs_f32();
         println!(">> complete in {:.2}s", t_read);
@@ -444,7 +486,7 @@ mod test {
     }
 
     #[tokio::test]
-    /// Check for metadata after index file update
+    /// Get fresh metadata after index file update
     async fn check_index_update() {
         let path = PathBuf::from("./test-data/metacache-3");
         let mc = MetaCache::new(path.clone(), 10).unwrap();
@@ -456,22 +498,20 @@ mod test {
         let md = Metadata::new(key.clone());
         let mut writer = mc.writer(&md).await.unwrap();
         writer.write_all(test_data_1).await.unwrap();
-        writer.commit().await.unwrap();  // direct use writer commit!
+        writer.commit().await.unwrap();
 
         // test_1: get back data
         let md1 = mc.metadata_checked(&key).await.unwrap();
         let mut reader = mc.reader(md1.integrity.clone()).await.unwrap();
         let mut result = Vec::<u8>::new();
         reader.read_to_end(&mut result).await.unwrap();
+        
         assert_eq!(test_data_1, result);
-
-        // delete data to force refresh metacache !!!
-        mc.remove_hash(&md1.integrity).await.unwrap();
 
         // rewrite data in the same key
         let mut writer = mc.writer(&md).await.unwrap();
         writer.write_all(test_data_2).await.unwrap();
-        writer.commit().await.unwrap();  // direct use writer commit!
+        writer.commit().await.unwrap();
 
         // test_2: get back new metadata and new data
         let md2 = mc.metadata_checked(&key).await.unwrap();
@@ -479,7 +519,7 @@ mod test {
         let mut reader = mc.reader(md2.integrity).await.unwrap();
         let mut result = Vec::<u8>::new();
         reader.read_to_end(&mut result).await.unwrap();
-        assert_eq!(test_data_2, result);
 
+        assert_eq!(test_data_2, result);
     }
 }

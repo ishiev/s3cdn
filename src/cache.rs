@@ -522,14 +522,17 @@ async fn try_get_object(mc: Arc<MetaCache>, key: &str)
     }
 }
 
-fn save_stream<K: AsRef<str>>(
+fn save_stream<K>(
     mc: Arc<MetaCache>,
     key: K,
     input: DataStream,
     meta: &ObjectMeta
-) -> DataStream {
+) -> DataStream 
+where 
+    String: From<K> 
+{
     // create metadata info for stream
-    let mut md = Metadata::new(String::from(key.as_ref()));
+    let mut md = Metadata::new(key.into());
     md.size = meta.content_length; // for check actual written size in commit
     md.metadata = json!{meta};
 
@@ -544,13 +547,13 @@ fn save_stream<K: AsRef<str>>(
                 // write value to cache file
                 fd.write_all(value)
                     .await
-                    .map_err(|e| S3Error::Io(e))?;
+                    .map_err(S3Error::Io)?;
             }
             // yield to stream
             yield value?;
         }
         // check size and commit in cache
-        mc.commit(md, fd)
+        fd.commit()
             .await
             .map_err(|e| S3Error::Http(500, e.to_string()))?;
     };
@@ -641,7 +644,7 @@ mod test {
         // input stream
         let input = Box::pin(
             stream! {
-                for i in (0..10) {
+                for i in 0..10 {
                     let item: StreamItem = Ok(Bytes::from(format!("hello {}\n", i)));
                     yield item
                 }
