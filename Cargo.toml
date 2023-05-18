@@ -24,6 +24,7 @@ time = "0.3"
 moka = { version = "0.10", features = ["future"] }
 sha1 = "0.10"
 hex = "0.4"
+walkdir = "2.3.3"
 
 [dev-dependencies]
 rand = "0.8"

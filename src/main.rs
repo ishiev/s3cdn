@@ -23,6 +23,7 @@ mod config;
 mod responder;
 mod cache;
 mod metacache;
+mod housekeeper;
 
 use crate::{
     config::Config,
