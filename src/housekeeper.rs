@@ -102,7 +102,7 @@ where PathBuf: From<P>
             let path = Arc::clone(&path);
             // start blocking task
             let res = task::spawn_blocking(move || {
-                clean_dir(Arc::clone(&path).as_path(), max_size)
+                clean_dir(&path, max_size)
             }).await;
             if let Err(e) = res {
                 error!("Housekeeper: task execution error {e}");
