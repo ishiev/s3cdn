@@ -1,13 +1,13 @@
 use std::{
-    path::PathBuf, 
+    path::{PathBuf, Path}, 
     collections::BinaryHeap, 
     time::SystemTime,
     cmp::Reverse, 
-    fs::remove_file
+    fs::remove_file, sync::Arc
 };
 
 use rocket::log::private::error;
-use tokio::task::JoinHandle;
+use tokio::{task, time};
 use walkdir::{DirEntry, WalkDir};
 
 /// Cacache content version
@@ -40,9 +40,8 @@ impl From<DirEntry> for Entry {
     }
 }
 
-fn clean_dir(mut path: PathBuf, max_size: u64) {
+fn clean_dir(mut path: &Path, max_size: u64) {
     // walk content dir tree and collect files
-    path.push(format!("content-v{CONTENT_VERSION}"));
     let walkdir = WalkDir::new(path).follow_links(true);
     let mut files = BinaryHeap::new();
     
@@ -88,10 +87,27 @@ fn clean_dir(mut path: PathBuf, max_size: u64) {
     debug!("Housekeeper: complete, now we have {} files, storage size {} bytes", files.len(), dir_size);
 }
 
-pub fn start_housekeeping<P>(path: P, max_size: u64) -> JoinHandle<()> 
-where PathBuf: From<P> {
-    let path = path.into();
-    tokio::task::spawn_blocking(move || {
-        clean_dir(path, max_size)
-    })
+pub fn shedule_housekeeping<P>(interval: time::Duration, path: P, max_size: u64)
+-> task::JoinHandle<()> 
+where PathBuf: From<P> 
+{
+    let path = Arc::new(PathBuf::from(path));
+    // create scheduler to start every interval
+    let sheduler = async move {
+        let mut interval = time::interval(interval);
+        interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        // start housekeeping every interval
+        loop {
+            interval.tick().await;
+            let path = Arc::clone(&path);
+            // start blocking task
+            let res = task::spawn_blocking(move || {
+                clean_dir(Arc::clone(&path).as_path(), max_size)
+            }).await;
+            if let Err(e) = res {
+                error!("Housekeeper: task execution error {e}");
+            }
+        }
+    };
+    task::spawn(sheduler)
 }
