@@ -3,6 +3,7 @@ use std::{
     time::SystemTime, 
     sync::Arc, 
     borrow::Cow,
+    time::Duration,
 };
 use cacache::{
     WriteOpts, 
@@ -21,6 +22,8 @@ use tokio::{
     task::{self, JoinHandle}
 };
 use sha1::{Sha1, Digest};
+
+use crate::housekeeper::Housekeeper;
 
 /// Cacache index version
 const INDEX_VERSION: &str = "5";
@@ -156,9 +159,11 @@ struct IndexWriter {
 }
 
 impl IndexWriter {
-    fn new(path: PathBuf) -> Self {
+    fn new(path: &Path) -> Self {
         // create index writer channel
         let (tx, mut rx) = mpsc::channel(5000);      
+        // make owned path for async task
+        let path = path.to_owned();
         // spawn a async task
         // task ended when the channel has been closed or Exit command received
         let task = task::spawn(async move {
@@ -183,7 +188,7 @@ impl IndexWriter {
             debug!("Waiting for index writer task...");
             task.await.ok();
         } else {
-            debug!("Writer task already exited.");
+            warn!("Writer task already exited.");
         }   
     }
 
@@ -201,12 +206,22 @@ pub struct MetaCache  {
     path: PathBuf,
     cache: Cache<String, Arc<Metadata>>,
     writer: IndexWriter,
+    keeper: Option<Housekeeper>,
 }
 
 impl MetaCache {
-    pub fn new(path: PathBuf, capacity: u64) -> Result<Self, Error> {
+    pub fn new(path: PathBuf, capacity: u64, max_size: Option<u64>, interval: Option<Duration>) -> Result<Self, Error> {
         // create index writer
-        let writer = IndexWriter::new(path.clone());
+        let writer = IndexWriter::new(&path);
+
+        // create housekeeper if max_size provided
+        let keeper = max_size.map(
+            |max_size| Housekeeper::new(
+                &path, 
+                max_size,
+                interval.unwrap_or_else(|| Duration::from_secs(3600)),                
+            )
+        );
 
         // create eviction closure
         // eviction will save metadata to index file
@@ -234,6 +249,7 @@ impl MetaCache {
             path, 
             cache,
             writer,
+            keeper,
         })
     }
 
@@ -246,7 +262,12 @@ impl MetaCache {
                     error!("Error send save command: {}", e);
                 });
         }
+        // exit writer task
         self.writer.exit().await;
+        // exit housekeeper task
+        if let Some(ref keeper) = self.keeper {
+            keeper.exit().await
+        }
         info!("Cache shutdown complete.");
     }
 
@@ -409,14 +430,14 @@ mod test {
         let test_data = "My test data".as_bytes();
 
         // write some data to cache instrance 1
-        let mc1 = MetaCache::new(path.clone(), 1000).unwrap();
+        let mc1 = MetaCache::new(path.clone(), 1000, None, None).unwrap();
         let md1 = Metadata::new(key.clone());
         let mut writer = mc1.writer(&md1).await.unwrap();
         writer.write_all(test_data).await.unwrap();
         writer.commit().await.unwrap();
         
         // read data from cache instance 2
-        let mc2 = MetaCache::new(path, 1000).unwrap();
+        let mc2 = MetaCache::new(path, 1000, None, None).unwrap();
         let md2 = mc2.metadata_checked(&key).await.unwrap();
         let mut reader = mc2.reader(md2.integrity).await.unwrap();
         let mut result = Vec::<u8>::new();
@@ -430,7 +451,9 @@ mod test {
     async fn metacache_insert_perf() {
         const ITEMS: usize = 10_000;
         let path = PathBuf::from("./test-data/metacache-2");
-        let mc = Arc::new(MetaCache::new(path.clone(), ITEMS as u64).unwrap());
+        let mc = Arc::new(
+            MetaCache::new(path.clone(), ITEMS as u64, None, None)
+            .unwrap());
 
         let keys: Vec<String> = (0..ITEMS)
             .map(|x| format!("key {x}"))
@@ -489,7 +512,7 @@ mod test {
     /// Get fresh metadata after index file update
     async fn check_index_update() {
         let path = PathBuf::from("./test-data/metacache-3");
-        let mc = MetaCache::new(path.clone(), 10).unwrap();
+        let mc = MetaCache::new(path.clone(), 10, None, None).unwrap();
         let key = "MyData".to_string();
         let test_data_1 = "My test data".as_bytes();
         let test_data_2 = "My another test data".as_bytes();

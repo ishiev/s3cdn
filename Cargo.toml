@@ -2,7 +2,7 @@
 name = "s3cdn"
 description = "S3 Content Delivery Node"
 authors = ["Nikolay Ishiev <ishiev@primetver.ru>"]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -20,7 +20,6 @@ serde_json = "1"
 ssri = "8"
 url = { version = "2", features = ["serde"] }
 cacache = { version = "*", default-features = false, features = ["tokio-runtime"] }
-time = "0.3"
 moka = { version = "0.10", features = ["future"] }
 sha1 = "0.10"
 hex = "0.4"

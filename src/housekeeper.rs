@@ -3,11 +3,13 @@ use std::{
     collections::BinaryHeap, 
     time::SystemTime,
     cmp::Reverse, 
-    fs::remove_file, sync::Arc
+    fs::remove_file, 
+    sync::Arc
 };
 
 use rocket::log::private::error;
-use tokio::{task, time};
+use tokio::{task, time, sync::RwLock, select};
+use tokio_util::sync::CancellationToken;
 use walkdir::{DirEntry, WalkDir};
 
 /// Cacache content version
@@ -40,7 +42,7 @@ impl From<DirEntry> for Entry {
     }
 }
 
-fn clean_dir(mut path: &Path, max_size: u64) {
+fn clean_dir(path: &Path, max_size: u64) {
     // walk content dir tree and collect files
     let walkdir = WalkDir::new(path).follow_links(true);
     let mut files = BinaryHeap::new();
@@ -51,6 +53,7 @@ fn clean_dir(mut path: &Path, max_size: u64) {
         match entry {
             Ok(entry) if entry.file_type().is_file() => {
                 let entry = Entry::from(entry);
+                debug!("Houkeeper: found {:?}, size: {}, time: {:?}", entry.path, entry.size, entry.time);
                 dir_size += entry.size;
                 // sort min first
                 files.push(Reverse(entry))
@@ -87,27 +90,67 @@ fn clean_dir(mut path: &Path, max_size: u64) {
     debug!("Housekeeper: complete, now we have {} files, storage size {} bytes", files.len(), dir_size);
 }
 
-pub fn shedule_housekeeping<P>(interval: time::Duration, path: P, max_size: u64)
--> task::JoinHandle<()> 
-where PathBuf: From<P> 
-{
-    let path = Arc::new(PathBuf::from(path));
-    // create scheduler to start every interval
-    let sheduler = async move {
-        let mut interval = time::interval(interval);
-        interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-        // start housekeeping every interval
-        loop {
-            interval.tick().await;
-            let path = Arc::clone(&path);
-            // start blocking task
-            let res = task::spawn_blocking(move || {
-                clean_dir(&path, max_size)
-            }).await;
-            if let Err(e) = res {
-                error!("Housekeeper: task execution error {e}");
+#[derive(Debug)]
+pub struct Housekeeper {
+    task: RwLock<Option<(task::JoinHandle<()>, CancellationToken)>>,
+}
+
+impl Housekeeper {
+    pub fn new(path: &Path, max_size: u64, interval: time::Duration) -> Self {
+        // make path to content storage
+        let path = Arc::new(
+            path.join(format!("content-v{CONTENT_VERSION}"))
+        );
+        // make cancel token
+        let cancel_token = CancellationToken::new();
+        let child_token = cancel_token.child_token();
+        // create scheduler to start every interval
+        let sheduler = async move {
+            let mut interval = time::interval(interval);
+            interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+            // start housekeeping every interval
+            loop {
+                select! {
+                    _ = child_token.cancelled() => {
+                        // cancel requested, exiting
+                        break
+                    }
+                    _ = interval.tick() => {
+                        // 
+                        let path = Arc::clone(&path);
+                        // start housekeeping as blocking task
+                        let res = task::spawn_blocking(move || {
+                            clean_dir(&path, max_size)
+                        }).await;
+                        if let Err(e) = res {
+                            error!("Housekeeper task execution error {e}");
+                        }
+                    }
+                }
             }
-        }
-    };
-    task::spawn(sheduler)
+            debug!("Housekeeper task finished.");
+        };
+        // save task to struct option
+        Self {
+            task: RwLock::new(Some(
+                (
+                    // start sheduler as async task
+                    task::spawn(sheduler),
+                    cancel_token
+                )
+            ))
+        }     
+    }
+
+    pub async fn exit(&self) {
+        if let Some(task) = self.task.write().await.take() {
+            // cancel request
+            task.1.cancel();
+            debug!("Waiting for housekeeper task...");
+            // waiting for task exit
+            task.0.await.ok();
+        } else {
+            warn!("Housekeeper task already exited.");
+        }  
+    }
 }

@@ -17,7 +17,7 @@ use ssri::Integrity;
 use std::{
     path::{PathBuf, Path}, 
     str::FromStr,
-    time::SystemTime, 
+    time::{SystemTime, Duration},
     collections::HashMap, 
     future::Future, 
     borrow::Cow, 
@@ -47,8 +47,8 @@ pub struct ConfigObjectCache {
     pub mode: CacheMode,
     pub root: Option<PathBuf>,
     pub max_age: Option<u64>,
-//    pub max_size: Option<u64>, // not implemented yet
-//    pub inactive: Option<u64>, // not implemented ye
+    pub max_size: Option<u64>,
+    pub keeper_interval: Option<u64>,
     pub use_stale: Option<u64>,
     pub in_memory_items: Option<u64>,
 }
@@ -58,10 +58,10 @@ impl ConfigObjectCache {
         let mut map = HeaderMap::new();
         // add cache-control header for external mode
         if self.mode == CacheMode::External {
-            // default 10 sec fresh
-            let max_age = self.max_age.unwrap_or(10); 
+            // default 0 secs
+            let max_age = self.max_age.unwrap_or_default(); 
             // default not use stale resource
-            let use_stale = self.use_stale.unwrap_or(0);
+            let use_stale = self.use_stale.unwrap_or_default();
             let stale_directive = if use_stale > 0 {
                 // use stale resource
                 format!(", stale-while-revalidate={use_stale}, stale-if-error={use_stale}")
@@ -281,7 +281,11 @@ impl ObjectCache {
                 Some(Arc::new(
                     MetaCache::new(
                         path, 
-                        config.in_memory_items.unwrap_or(10_000)
+                        config.in_memory_items.unwrap_or(10_000),
+                        // in megabytes
+                        config.max_size.map(|s| s*1024*1024),
+                        // in seconds
+                        config.keeper_interval.map(Duration::from_secs)
                     )
                     .map_err(|e| S3Error::Http(500, format!("Cache create error: {}", e)))?
                 ))
@@ -631,7 +635,9 @@ mod test {
             bucket: "bucket1",
             key: Path::new("my key")
         }.cache_key();
-        let mc: Arc<MetaCache> = Arc::new(MetaCache::new(PathBuf::from(dir), 10).unwrap());
+        let mc: Arc<MetaCache> = Arc::new(
+            MetaCache::new(PathBuf::from(dir), 10, None, None)
+            .unwrap());
 
         let meta1 = ObjectMeta { 
             content_type: Some(ContentType::HTML.to_string()), 
