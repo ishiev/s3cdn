@@ -3,7 +3,6 @@ use std::{
     time::SystemTime, 
     sync::Arc, 
     borrow::Cow,
-    time::Duration,
 };
 use cacache::{
     WriteOpts, 
@@ -23,7 +22,7 @@ use tokio::{
 };
 use sha1::{Sha1, Digest};
 
-use crate::housekeeper::Housekeeper;
+use crate::housekeeper::{Housekeeper, ConfigHousekeeper};
 
 /// Cacache index version
 const INDEX_VERSION: &str = "5";
@@ -210,16 +209,15 @@ pub struct MetaCache  {
 }
 
 impl MetaCache {
-    pub fn new(path: PathBuf, capacity: u64, max_size: Option<u64>, interval: Option<Duration>) -> Result<Self, Error> {
+    pub fn new(path: PathBuf, capacity: u64, config_hk: Option<ConfigHousekeeper>) -> Result<Self, Error> {
         // create index writer
         let writer = IndexWriter::new(&path);
 
-        // create housekeeper if max_size provided
-        let keeper = max_size.map(
-            |max_size| Housekeeper::new(
+        // create housekeeper if config provided
+        let keeper = config_hk.map(
+            |config| Housekeeper::new(
                 &path, 
-                max_size,
-                interval.unwrap_or_else(|| Duration::from_secs(3600)),                
+                config          
             )
         );
 
@@ -430,14 +428,14 @@ mod test {
         let test_data = "My test data".as_bytes();
 
         // write some data to cache instrance 1
-        let mc1 = MetaCache::new(path.clone(), 1000, None, None).unwrap();
+        let mc1 = MetaCache::new(path.clone(), 1000, None).unwrap();
         let md1 = Metadata::new(key.clone());
         let mut writer = mc1.writer(&md1).await.unwrap();
         writer.write_all(test_data).await.unwrap();
         writer.commit().await.unwrap();
         
         // read data from cache instance 2
-        let mc2 = MetaCache::new(path, 1000, None, None).unwrap();
+        let mc2 = MetaCache::new(path, 1000, None).unwrap();
         let md2 = mc2.metadata_checked(&key).await.unwrap();
         let mut reader = mc2.reader(md2.integrity).await.unwrap();
         let mut result = Vec::<u8>::new();
@@ -452,7 +450,7 @@ mod test {
         const ITEMS: usize = 10_000;
         let path = PathBuf::from("./test-data/metacache-2");
         let mc = Arc::new(
-            MetaCache::new(path.clone(), ITEMS as u64, None, None)
+            MetaCache::new(path.clone(), ITEMS as u64, None)
             .unwrap());
 
         let keys: Vec<String> = (0..ITEMS)
@@ -512,7 +510,7 @@ mod test {
     /// Get fresh metadata after index file update
     async fn check_index_update() {
         let path = PathBuf::from("./test-data/metacache-3");
-        let mc = MetaCache::new(path.clone(), 10, None, None).unwrap();
+        let mc = MetaCache::new(path.clone(), 10, None).unwrap();
         let key = "MyData".to_string();
         let test_data_1 = "My test data".as_bytes();
         let test_data_2 = "My another test data".as_bytes();

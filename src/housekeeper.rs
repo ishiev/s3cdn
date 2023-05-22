@@ -1,13 +1,13 @@
 use std::{
     path::{PathBuf, Path}, 
     collections::BinaryHeap, 
-    time::SystemTime,
+    time::{SystemTime, Duration},
     cmp::Reverse, 
     fs::remove_file, 
     sync::Arc
 };
 
-use rocket::log::private::error;
+use serde::{Deserialize, Serialize};
 use tokio::{task, time, sync::RwLock, select};
 use tokio_util::sync::CancellationToken;
 use walkdir::{DirEntry, WalkDir};
@@ -15,16 +15,24 @@ use walkdir::{DirEntry, WalkDir};
 /// Cacache content version
 const CONTENT_VERSION: &str = "2";
 
+/// Housekeerer config
+#[derive(Default, Debug, Deserialize, Serialize)]
+pub struct ConfigHousekeeper {
+    pub max_size: u64,                  // in bytes
+    pub max_duration: Option<u64>,      // in seconds
+    pub keeper_interval: Option<u64>,   // start interval in seconds, default 3600
+}
+
 /// Content storage entry 
 /// Field ordering is important!
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
-struct Entry {
+struct TimeOrdEntry {
     time: Option<SystemTime>, // access or modify time
     size: u64,                // entry size in bytes
     path: PathBuf,            // path to entry
 }
 
-impl From<DirEntry> for Entry {
+impl From<DirEntry> for TimeOrdEntry {
     fn from(value: DirEntry) -> Self {
         let md = value.metadata();
         Self {
@@ -42,7 +50,7 @@ impl From<DirEntry> for Entry {
     }
 }
 
-fn clean_dir(path: &Path, max_size: u64) {
+fn housekeep(path: &Path, max_size: u64, _max_duration: Option<Duration>) {
     // walk content dir tree and collect files
     let walkdir = WalkDir::new(path).follow_links(true);
     let mut files = BinaryHeap::new();
@@ -52,7 +60,7 @@ fn clean_dir(path: &Path, max_size: u64) {
     for entry in walkdir {
         match entry {
             Ok(entry) if entry.file_type().is_file() => {
-                let entry = Entry::from(entry);
+                let entry = TimeOrdEntry::from(entry);
                 debug!("Houkeeper: found {:?}, size: {}, time: {:?}", entry.path, entry.size, entry.time);
                 dir_size += entry.size;
                 // sort min first
@@ -96,7 +104,7 @@ pub struct Housekeeper {
 }
 
 impl Housekeeper {
-    pub fn new(path: &Path, max_size: u64, interval: time::Duration) -> Self {
+    pub fn new(path: &Path, config: ConfigHousekeeper) -> Self {
         // make path to content storage
         let path = Arc::new(
             path.join(format!("content-v{CONTENT_VERSION}"))
@@ -106,8 +114,17 @@ impl Housekeeper {
         let child_token = cancel_token.child_token();
         // create scheduler to start every interval
         let sheduler = async move {
-            let mut interval = time::interval(interval);
+            // make shedule interval
+            let mut interval = time::interval(config
+                .keeper_interval
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::from_secs(3600))
+            );
             interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+            // get maximum storage duration 
+            let max_duration = config
+                .max_duration
+                .map(Duration::from_secs);
             // start housekeeping every interval
             loop {
                 select! {
@@ -120,7 +137,7 @@ impl Housekeeper {
                         let path = Arc::clone(&path);
                         // start housekeeping as blocking task
                         let res = task::spawn_blocking(move || {
-                            clean_dir(&path, max_size)
+                            housekeep(&path, config.max_size, max_duration)
                         }).await;
                         if let Err(e) = res {
                             error!("Housekeeper task execution error {e}");
@@ -130,7 +147,8 @@ impl Housekeeper {
             }
             debug!("Housekeeper task finished.");
         };
-        // save task to struct option
+        // start task and save to struct option
+        debug!("Housekeeper task started.");
         Self {
             task: RwLock::new(Some(
                 (

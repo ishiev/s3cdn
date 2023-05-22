@@ -17,7 +17,7 @@ use ssri::Integrity;
 use std::{
     path::{PathBuf, Path}, 
     str::FromStr,
-    time::{SystemTime, Duration},
+    time::SystemTime,
     collections::HashMap, 
     future::Future, 
     borrow::Cow, 
@@ -27,10 +27,10 @@ use tokio::io::{
     AsyncWriteExt, 
     AsyncReadExt
 };
-use crate::metacache::{
+use crate::{metacache::{
     MetaCache, 
     Metadata
-};
+}, housekeeper::ConfigHousekeeper};
 
 /// Cache mode
 #[derive(Default, Debug, Deserialize, Serialize, PartialEq, Clone, Copy)]
@@ -47,8 +47,6 @@ pub struct ConfigObjectCache {
     pub mode: CacheMode,
     pub root: Option<PathBuf>,
     pub max_age: Option<u64>,
-    pub max_size: Option<u64>,
-    pub keeper_interval: Option<u64>,
     pub use_stale: Option<u64>,
     pub in_memory_items: Option<u64>,
 }
@@ -270,7 +268,7 @@ pub struct ObjectCache {
 
 impl ObjectCache {
     /// Create from config
-    pub fn new(mut config: ConfigObjectCache) -> Result<Self, S3Error> {
+    pub fn new(mut config: ConfigObjectCache, config_hk: Option<ConfigHousekeeper>) -> Result<Self, S3Error> {
         // create metacache only in internal cache mode
         let mc = {
             if config.mode == CacheMode::Internal {
@@ -282,10 +280,7 @@ impl ObjectCache {
                     MetaCache::new(
                         path, 
                         config.in_memory_items.unwrap_or(10_000),
-                        // in megabytes
-                        config.max_size.map(|s| s*1024*1024),
-                        // in seconds
-                        config.keeper_interval.map(Duration::from_secs)
+                        config_hk
                     )
                     .map_err(|e| S3Error::Http(500, format!("Cache create error: {}", e)))?
                 ))
@@ -636,7 +631,7 @@ mod test {
             key: Path::new("my key")
         }.cache_key();
         let mc: Arc<MetaCache> = Arc::new(
-            MetaCache::new(PathBuf::from(dir), 10, None, None)
+            MetaCache::new(PathBuf::from(dir), 10, None)
             .unwrap());
 
         let meta1 = ObjectMeta { 

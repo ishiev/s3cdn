@@ -158,7 +158,10 @@ async fn main() {
     }
 
     // setup cache
-    let cache = ObjectCache::new(config.cache.take().unwrap_or_default())
+    let cache = ObjectCache::new(
+            config.cache.take().unwrap_or_default(),
+            config.housekeeper.take()
+        )   
         .unwrap_or_else(|err| {
             eprintln!("Init error: {err}");
             process::exit(1)
