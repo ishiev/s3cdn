@@ -388,20 +388,8 @@ async fn index_meta(cache: &Path, key: &str) -> std::io::Result<IndexMeta> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use rand::{
-        Rng, 
-        distributions::Uniform
-    };
     use serde_json::json;
     use tokio::{time::Instant, io::{AsyncWriteExt, AsyncReadExt}};
-
-    #[allow(dead_code)]
-    fn gen_rand_vec(size: usize) -> Vec<u8> {
-        let mut rng = rand::thread_rng();
-        let range = Uniform::new(0, 255);
-
-        (0..size).map(|_| rng.sample(range)).collect()
-    }
 
     fn now() -> u128 {
         SystemTime::now()
