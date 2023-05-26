@@ -2,7 +2,7 @@
 name = "s3cdn"
 description = "S3 Content Delivery Node"
 authors = ["Nikolay Ishiev <ishiev@primetver.ru>"]
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
