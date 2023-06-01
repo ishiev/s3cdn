@@ -12,7 +12,7 @@ pub enum Error {
     #[error("Access forbidden: {0}")]
     #[response(status = 403)]
     Forbidden(String),
-    #[error("Service unavailable: {0}")]
+    #[error("Origin unavailable: {0}")]
     #[response(status = 503)]
     Unavailable(String),
     #[error("Internal error: {0}")]
@@ -38,5 +38,11 @@ impl From<S3Error> for Error {
             S3Error::Reqwest(e)     => Error::Unavailable(e.to_string()),
             _ => Error::Internal(e.to_string())
         }
+    }
+}
+
+impl From<serde_json::error::Error> for Error {
+    fn from(e: serde_json::error::Error) -> Self {
+        Error::Internal(e.to_string())
     }
 }

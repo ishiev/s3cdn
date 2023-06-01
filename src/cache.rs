@@ -505,8 +505,7 @@ async fn try_get_object(mc: Arc<MetaCache>, key: &str)
     if let Some(md) = mc.metadata_checked(key).await {
         let sri = md.integrity;
         // decode meta from json
-        let meta: ObjectMeta = serde_json::from_value(md.metadata)
-            .map_err(|e| Error::Internal(e.to_string()))?;
+        let meta: ObjectMeta = serde_json::from_value(md.metadata)?;
         // get stream from cache and construct object
         let stream = read_stream(mc, sri.to_owned());
         Ok(Some(
