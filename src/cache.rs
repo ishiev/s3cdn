@@ -6,7 +6,7 @@ use rocket::{
 };
 use s3::{
     request::DataStream, 
-    error::S3Error
+    error::S3Error, 
 };
 use serde::{
     Deserialize, 
@@ -27,10 +27,11 @@ use tokio::io::{
     AsyncWriteExt, 
     AsyncReadExt
 };
-use crate::{metacache::{
-    MetaCache, 
-    Metadata
-}, housekeeper::ConfigHousekeeper};
+use crate::{
+    metacache::{MetaCache, Metadata},
+    housekeeper::ConfigHousekeeper,
+    error::Error,
+};
 
 /// Cache mode
 #[derive(Default, Debug, Deserialize, Serialize, PartialEq, Clone, Copy)]
@@ -230,8 +231,8 @@ enum ValidationResult {
     Revalidated(DataObject),
     Updated(DataObject),
     Stale(DataObject),
-    NotFound(S3Error),
-    Err(S3Error)
+    NotFound(Error),
+    Err(Error)
 }
 
 impl ValidationResult {
@@ -268,21 +269,21 @@ pub struct ObjectCache {
 
 impl ObjectCache {
     /// Create from config
-    pub fn new(mut config: ConfigObjectCache, config_hk: Option<ConfigHousekeeper>) -> Result<Self, S3Error> {
+    pub fn new(mut config: ConfigObjectCache, config_hk: Option<ConfigHousekeeper>) -> Result<Self, Error> {
         // create metacache only in internal cache mode
         let mc = {
             if config.mode == CacheMode::Internal {
                 // path for cache storage
                 let path = config.root
                     .take()
-                    .ok_or(S3Error::Http(500, "Cache root config param not defined!".to_string()))?;           
+                    .ok_or(Error::Config("Cache root config param not defined!".to_string()))?;           
                 Some(Arc::new(
                     MetaCache::new(
                         path, 
                         config.in_memory_items.unwrap_or(10_000),
                         config_hk
                     )
-                    .map_err(|e| S3Error::Http(500, format!("Cache create error: {}", e)))?
+                    .map_err(|e| Error::Internal(format!("Cache create error: {}", e)))?
                 ))
             } else {
                 None
@@ -304,11 +305,11 @@ impl ObjectCache {
 
     /// Get object from cache or from origin source, bypass if mode != Internal
     pub async fn get_object<'a, K, F, Fut>(&self, key: K, origin: F, condition: ConditionalHeaders<'a>)
-    -> Result<DataObject, S3Error> 
+    -> Result<DataObject, Error> 
     where 
         K: AsRef<ObjectKey<'a>> + std::marker::Copy,
         F: FnOnce(ConditionalHeaders<'a>)->Fut,
-        Fut: Future<Output = Result<DataObject, S3Error>>
+        Fut: Future<Output = Result<DataObject, Error>>
     {
         let mc = match self.mc {
             Some(ref mc) => mc,
@@ -370,10 +371,10 @@ impl ObjectCache {
                 // got updated object from origin
                 // remove old object from cache
                 let sri = sri
-                    .ok_or(S3Error::Http(500, "Error get sri while updating object in cache".to_string()))?;
+                    .ok_or(Error::Internal("Error get sri while updating object in cache".to_string()))?;
                 mc.remove_hash(&sri)
                     .await
-                    .map_err(|e| S3Error::Http(500,format!("Error remove object: {e}")))?;
+                    .map_err(|e| Error::Internal(format!("Error remove object: {e}")))?;
                 // save new object to cache
                 let stream = save_stream(
                     Arc::clone(mc), 
@@ -398,10 +399,10 @@ impl ObjectCache {
                 // object not found in origin
                 // remove object from cache
                 let sri = sri
-                    .ok_or(S3Error::Http(500, "Error get sri while removing object from cache".to_string()))?;
+                    .ok_or(Error::Internal("Error get sri while removing object from cache".to_string()))?;
                 mc.remove_hash(&sri)
                     .await
-                    .map_err(|e| S3Error::Http(500,format!("Error remove object: {e}")))?;
+                    .map_err(|e| Error::Internal(format!("Error remove object: {e}")))?;
                 // return error
                 Err(e)
             },
@@ -414,7 +415,7 @@ impl ObjectCache {
     -> ValidationResult 
     where
         F: FnOnce(ConditionalHeaders<'a>)->Fut,
-        Fut: Future<Output = Result<DataObject, S3Error>>
+        Fut: Future<Output = Result<DataObject, Error>>
     {
         if let Some(obj) = obj {         
 
@@ -433,9 +434,9 @@ impl ObjectCache {
                 // request origin for revalidate
                 match origin(conditional).await {
                     Ok(new_obj) => ValidationResult::Updated(new_obj),
-                    Err(S3Error::Http(304, _)) => ValidationResult::Revalidated(obj),
-                    Err(S3Error::Http(404, msg)) => ValidationResult::NotFound(
-                        S3Error::Http(404, format!("Object was removed from origin, error message: {msg}"))
+                    Err(Error::NotModified(_)) => ValidationResult::Revalidated(obj),
+                    Err(Error::NotFound(msg)) => ValidationResult::NotFound(
+                        Error::NotFound(format!("Object was removed from origin, error message: {msg}"))
                     ),
                     Err(e) => {
                         // check for stale config
@@ -469,13 +470,13 @@ impl ObjectCache {
 }
 
 fn check_condition(obj: DataObject, condition: ConditionalHeaders) 
--> Result<DataObject, S3Error> {
+-> Result<DataObject, Error> {
     // check etag
     if let Some(req_etag) = condition.if_none_match {
         if let Some(ref obj_etag) = obj.meta.etag {
             if &req_etag == obj_etag {
                 // not modified
-                return Err(S3Error::Http(304, String::new()))
+                return Err(Error::NotModified(String::new()))
             } else {
                 // modified
                 return Ok(obj)
@@ -491,7 +492,7 @@ fn check_condition(obj: DataObject, condition: ConditionalHeaders)
                 .unwrap_or(std::time::UNIX_EPOCH);
             if &req_modified == obj_modified {
                 // not modified
-                return Err(S3Error::Http(304, String::new()))
+                return Err(Error::NotModified(String::new()))
             }
         }
     }
@@ -500,12 +501,12 @@ fn check_condition(obj: DataObject, condition: ConditionalHeaders)
 }
 
 async fn try_get_object(mc: Arc<MetaCache>, key: &str)
- -> Result<Option<(DataObject, Integrity)>, S3Error> {
+ -> Result<Option<(DataObject, Integrity)>, Error> {
     if let Some(md) = mc.metadata_checked(key).await {
         let sri = md.integrity;
         // decode meta from json
         let meta: ObjectMeta = serde_json::from_value(md.metadata)
-            .map_err(|e| S3Error::Http(500, e.to_string()))?;
+            .map_err(|e| Error::Internal(e.to_string()))?;
         // get stream from cache and construct object
         let stream = read_stream(mc, sri.to_owned());
         Ok(Some(

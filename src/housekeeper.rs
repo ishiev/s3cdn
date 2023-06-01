@@ -317,7 +317,7 @@ mod test {
         gen_file(&base_path.join("c/05"),10); sleep_ms(10);
         gen_file(&base_path.join("c/06"),35); sleep_ms(10);
 
-        // delele 35 bytes (100 - 75)
+        // delele 35 bytes (110 - 75)
         housekeep(&base_path, 75, None);
         
         // check files (01 and 03 must be deleted)

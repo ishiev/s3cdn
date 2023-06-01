@@ -14,52 +14,21 @@ use rocket::{
     http::Status,
     Request, request::{FromRequest, Outcome},
 };
-use s3::{
-    Bucket,
-    error::S3Error,
-};
+use s3::Bucket;
 
 mod config;
 mod responder;
 mod cache;
 mod metacache;
 mod housekeeper;
+mod error;
 
 use crate::{
     config::Config,
     responder::CacheResponder,
     cache::{DataObject, ObjectKey, ObjectCache, ConditionalHeaders},
+    error::Error,
 };
-
-
-#[derive(Responder)]
-enum Error {
-    #[response(status = 304)]
-    NotModified(String),
-    #[response(status = 404)]
-    NotFound(String),
-    #[response(status = 403)]
-    Forbidden(String),
-    #[response(status = 503)]
-    Unavailable(String),
-    #[response(status = 500)]
-    Internal(String)
-}
-
-impl From<S3Error> for Error {
-    fn from(e: S3Error) -> Self {
-        match e {
-            S3Error::Http(304, e)   => Error::NotModified(e),
-            S3Error::Http(404, _)   => Error::NotFound(e.to_string()),
-            S3Error::Http(403, _)   => Error::Forbidden(e.to_string()),
-            S3Error::Credentials(_) => Error::Forbidden(e.to_string()),
-            S3Error::MaxExpiry(_)   => Error::Unavailable(e.to_string()),
-            S3Error::HttpFail       => Error::Unavailable(e.to_string()),
-            S3Error::Reqwest(e)     => Error::Unavailable(e.to_string()),
-            _ => Error::Internal(e.to_string())
-        }
-    }
-}
 
 #[catch(default)]
 fn default_catcher(status: Status, _: &Request) -> String {
