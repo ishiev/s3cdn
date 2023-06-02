@@ -6,7 +6,7 @@ use rocket::{
 };
 use s3::{
     request::DataStream, 
-    error::S3Error
+    error::S3Error, 
 };
 use serde::{
     Deserialize, 
@@ -17,17 +17,21 @@ use ssri::Integrity;
 use std::{
     path::{PathBuf, Path}, 
     str::FromStr,
-    time::SystemTime, 
+    time::SystemTime,
     collections::HashMap, 
     future::Future, 
     borrow::Cow, 
+    sync::Arc 
 };
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
-use cacache::{
-    WriteOpts, 
-    Reader,
+use tokio::io::{
+    AsyncWriteExt, 
+    AsyncReadExt
 };
-
+use crate::{
+    metacache::{MetaCache, Metadata},
+    housekeeper::ConfigHousekeeper,
+    error::Error,
+};
 
 /// Cache mode
 #[derive(Default, Debug, Deserialize, Serialize, PartialEq, Clone, Copy)]
@@ -44,10 +48,8 @@ pub struct ConfigObjectCache {
     pub mode: CacheMode,
     pub root: Option<PathBuf>,
     pub max_age: Option<u64>,
-    pub max_size: Option<u64>,
-    pub inactive: Option<u64>,
     pub use_stale: Option<u64>,
-    pub background_update: Option<u64>,
+    pub in_memory_items: Option<u64>,
 }
 
 impl ConfigObjectCache {
@@ -55,12 +57,12 @@ impl ConfigObjectCache {
         let mut map = HeaderMap::new();
         // add cache-control header for external mode
         if self.mode == CacheMode::External {
-            // default 10 sec fresh
-            let max_age = self.max_age.unwrap_or(10); 
+            // default 0 secs
+            let max_age = self.max_age.unwrap_or_default(); 
             // default not use stale resource
-            let use_stale = self.use_stale.unwrap_or(0);
+            let use_stale = self.use_stale.unwrap_or_default();
             let stale_directive = if use_stale > 0 {
-                // use stale resource for 1 day
+                // use stale resource
                 format!(", stale-while-revalidate={use_stale}, stale-if-error={use_stale}")
             } else {
                 // not use stale resource, must revalidate or return error
@@ -159,7 +161,6 @@ impl From<&HeaderMap<'_>> for ObjectMeta {
 }
 
 impl From<&HashMap<String, String>> for ObjectMeta {
-    
     fn from(headers: &HashMap<String, String>) -> Self {
         let mut map = HeaderMap::new();
         for (name, value) in headers {
@@ -170,6 +171,7 @@ impl From<&HashMap<String, String>> for ObjectMeta {
 }
 
 // Values from conditional request
+#[derive(Default, Debug)]
 pub struct ConditionalHeaders<'r> {
     if_modified_since: Option<Cow<'r, str>>,
     if_none_match: Option<Cow<'r, str>>
@@ -188,10 +190,6 @@ impl<'r> ConditionalHeaders<'r> {
             map.add_raw(Self::IF_NONE_MATCH, value);
         }
         map
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.if_modified_since.is_none() && self.if_none_match.is_none()
     }
 }
 
@@ -233,8 +231,8 @@ enum ValidationResult {
     Revalidated(DataObject),
     Updated(DataObject),
     Stale(DataObject),
-    NotFound(S3Error),
-    Err(S3Error)
+    NotFound(Error),
+    Err(Error)
 }
 
 impl ValidationResult {
@@ -260,66 +258,75 @@ impl ValidationResult {
         };
         Header::new(Self::HEADER_NAME, value)
     }
-
 }
 
 /// Object cache
 pub struct ObjectCache {
     config: ConfigObjectCache,
     headers: HeaderMap<'static>,
-}
-
-impl From<ConfigObjectCache> for ObjectCache {
-    fn from(config: ConfigObjectCache) -> Self {
-        let headers = config.make_headers();
-        Self {
-            config,
-            headers,
-        }
-    }
+    mc: Option<Arc<MetaCache>>,
 }
 
 impl ObjectCache {
+    /// Create from config
+    pub fn new(mut config: ConfigObjectCache, config_hk: Option<ConfigHousekeeper>) -> Result<Self, Error> {
+        // create metacache only in internal cache mode
+        let mc = {
+            if config.mode == CacheMode::Internal {
+                // path for cache storage
+                let path = config.root
+                    .take()
+                    .ok_or(Error::Config("Cache root config param not defined!".to_string()))?;           
+                Some(Arc::new(
+                    MetaCache::new(
+                        path, 
+                        config.in_memory_items.unwrap_or(10_000),
+                        config_hk
+                    )
+                    .map_err(|e| Error::Internal(format!("Cache create error: {}", e)))?
+                ))
+            } else {
+                None
+            }
+        }; 
+        // cache-control headers
+        let headers = config.make_headers();      
+        Ok(Self {
+            config,
+            headers,
+            mc
+        })
+    }
+
     /// Get cache-control headers for response
     pub fn headers(&self) -> HeaderMap<'static> {
         self.headers.to_owned()
     }
 
-    pub fn mode(&self) -> CacheMode {
-        self.config.mode
-    }
-
     /// Get object from cache or from origin source, bypass if mode != Internal
-    pub async fn get_object<'a, K, F, Fut>(&self, key: K, origin: F)
-    -> Result<DataObject, S3Error> 
+    pub async fn get_object<'a, K, F, Fut>(&self, key: K, origin: F, condition: ConditionalHeaders<'a>)
+    -> Result<DataObject, Error> 
     where 
         K: AsRef<ObjectKey<'a>> + std::marker::Copy,
-        F: FnOnce(Option<ConditionalHeaders <'a>>)->Fut,
-        Fut: Future<Output = Result<DataObject, S3Error>>
+        F: FnOnce(ConditionalHeaders<'a>)->Fut,
+        Fut: Future<Output = Result<DataObject, Error>>
     {
-        if self.mode() == CacheMode::Internal {
-            self.get_cached_object(key, origin).await
-        } else {
-            origin(None).await
-        }
-    }
-
-    /// Get object from cache or from origin source
-    pub async fn get_cached_object<'a, K, F, Fut>(&self, key: K, origin: F) 
-    -> Result<DataObject, S3Error> 
-    where 
-        K: AsRef<ObjectKey<'a>> + std::marker::Copy,
-        F: FnOnce(Option<ConditionalHeaders<'a>>)->Fut,
-        Fut: Future<Output = Result<DataObject, S3Error>>
-    {
-        let cache = self.config.root
-            .as_ref()
-            .ok_or(S3Error::Http(500, "Cache root config param not defined".to_string()))?;
+        let mc = match self.mc {
+            Some(ref mc) => mc,
+            None => {
+                // no cache, short circuit to origin 
+                return origin(condition).await
+            }
+        };
+                
+        // make cache item key
         let key = key.as_ref().cache_key();
+        
         // try to get object from cache
-        let (obj, sri) = try_get_object(cache, &key)
+        let (obj, sri) = try_get_object(Arc::clone(mc), &key)
             .await? 
             .map_or((None, None), |(obj, sri)| (Some(obj), Some(sri)));
+        
         // validate cache object
         let res = self.validate(obj, origin).await;
         let status = res.header();
@@ -330,10 +337,10 @@ impl ObjectCache {
                 // got new object from origin
                 // save stream to cache
                 let stream = save_stream(
-                    cache, 
+                    Arc::clone(mc), 
                     key, 
                     obj.stream, 
-                    obj.meta.to_owned()
+                    &obj.meta
                 );
                 // return new object
                 Ok(DataObject {
@@ -346,35 +353,34 @@ impl ObjectCache {
                 // fresh from cache 
                 // return with status
                 obj.status = Some(status);
-                Ok(obj)
+                check_condition(obj, condition)
             },
             ValidationResult::Revalidated(mut obj) => {
                 // cache object revalidated by origin
                 // update time and status
                 obj.meta.date = Some(SystemTime::now());
                 obj.status = Some(status);  
-                // make new metadata
-                let sri = sri
-                    .ok_or(S3Error::Http(500, "Error get sri while removing object from cache".to_string()))?;
-                let opts = WriteOpts::new()
-                    .integrity(sri)
-                    .size(obj.meta.content_length.unwrap_or(0))
-                    .metadata(json!(obj.meta));
-                // insert metadata with updated time
-                cacache::index::insert_async(cache, &key, opts)
-                    .await
-                    .map_err(|e| S3Error::Http(500,format!("Error insert new metadata: {e}")))?;
-                // return object from cache
-                Ok(obj)
+                // make metadata for update
+                let mut md = Metadata::new(key);
+                md.metadata = json!(obj.meta);
+                mc.update(md).await;
+                // return from cache
+                check_condition(obj, condition)
             },
             ValidationResult::Updated(obj) => {
                 // got updated object from origin
-                // replace object in cache
+                // remove old object from cache
+                let sri = sri
+                    .ok_or(Error::Internal("Error get sri while updating object in cache".to_string()))?;
+                mc.remove_hash(&sri)
+                    .await
+                    .map_err(|e| Error::Internal(format!("Error remove object: {e}")))?;
+                // save new object to cache
                 let stream = save_stream(
-                    cache, 
+                    Arc::clone(mc), 
                     key, 
                     obj.stream, 
-                    obj.meta.to_owned()
+                    &obj.meta
                 );
                 // return object from origin
                 Ok(DataObject {
@@ -387,16 +393,16 @@ impl ObjectCache {
                 // got stale object from cache
                 // return with status
                 obj.status = Some(status);
-                Ok(obj)
+                check_condition(obj, condition)
             },
             ValidationResult::NotFound(e) => {
                 // object not found in origin
                 // remove object from cache
                 let sri = sri
-                    .ok_or(S3Error::Http(500, "Error get sri while removing object from cache".to_string()))?;
-                cacache::remove_hash(cache, &sri)
+                    .ok_or(Error::Internal("Error get sri while removing object from cache".to_string()))?;
+                mc.remove_hash(&sri)
                     .await
-                    .map_err(|e| S3Error::Http(500,format!("Error remove object: {e}")))?;
+                    .map_err(|e| Error::Internal(format!("Error remove object: {e}")))?;
                 // return error
                 Err(e)
             },
@@ -404,12 +410,12 @@ impl ObjectCache {
         }
     }
 
-    /// Validate object or get from origin
+    /// Validate object or get new from origin
     async fn validate<'a, F, Fut>(&self, obj: Option<DataObject>, origin: F)
     -> ValidationResult 
     where
-        F: FnOnce(Option<ConditionalHeaders<'a>>)->Fut,
-        Fut: Future<Output = Result<DataObject, S3Error>>
+        F: FnOnce(ConditionalHeaders<'a>)->Fut,
+        Fut: Future<Output = Result<DataObject, Error>>
     {
         if let Some(obj) = obj {         
 
@@ -426,11 +432,11 @@ impl ObjectCache {
                 // object expired, need revalidation
                 let conditional = ConditionalHeaders::from(obj.meta.clone());
                 // request origin for revalidate
-                match origin(Some(conditional)).await {
+                match origin(conditional).await {
                     Ok(new_obj) => ValidationResult::Updated(new_obj),
-                    Err(S3Error::Http(304, _)) => ValidationResult::Revalidated(obj),
-                    Err(S3Error::Http(404, msg)) => ValidationResult::NotFound(
-                        S3Error::Http(404, format!("Object was removed from origin, error message: {msg}"))
+                    Err(Error::NotModified(_)) => ValidationResult::Revalidated(obj),
+                    Err(Error::NotFound(msg)) => ValidationResult::NotFound(
+                        Error::NotFound(format!("Object was removed from origin, error message: {msg}"))
                     ),
                     Err(e) => {
                         // check for stale config
@@ -449,85 +455,103 @@ impl ObjectCache {
             }
         } else {
             // get object from origin source
-            match origin(None).await {
+            match origin(ConditionalHeaders::default()).await {
                 Ok(new_obj) => ValidationResult::Origin(new_obj),
                 Err(e) => ValidationResult::Err(e)
             }  
         }
     }
+
+    pub async fn shutdown(&self) {
+        if let Some(ref mc) = self.mc {
+            mc.shutdown().await;        
+        }
+    }
 }
 
-async fn try_get_object<P: AsRef<Path>, K: AsRef<str>>(
-    path: P,
-    key: K
-) -> Result<Option<(DataObject, Integrity)>, S3Error> {
-    if let Some(md) = cacache::metadata(&path, key)
-        .await
-        .map_err(|e| S3Error::Http(500, e.to_string()))? {
-        // check data in cache
-        let sri = md.integrity;
-        if cacache::exists(&path, &sri).await {
-            // decode meta from json
-            let meta: ObjectMeta = serde_json::from_value(md.metadata)
-                .map_err(|e| S3Error::Http(500, e.to_string()))?;
-            // get stream from cache and construct object
-            let stream = read_stream(&path, sri.to_owned());
-            Ok(Some((
-                DataObject {
-                    meta,
-                    stream,
-                    status: None,
-                },
-                sri
-            )))
-        } else {
-            Ok(None)
+fn check_condition(obj: DataObject, condition: ConditionalHeaders) 
+-> Result<DataObject, Error> {
+    // check etag
+    if let Some(req_etag) = condition.if_none_match {
+        if let Some(ref obj_etag) = obj.meta.etag {
+            if &req_etag == obj_etag {
+                // not modified
+                return Err(Error::NotModified(String::new()))
+            } else {
+                // modified
+                return Ok(obj)
+            }
         }
+    } 
+    // check modified time
+    if let Some(req_modified_str) = condition.if_modified_since {
+        if let Some(ref obj_modified) = obj.meta.last_modified {
+            let req_modified = HttpDate::from_str(req_modified_str.as_ref())
+                .ok()
+                .map(|x| x.into())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            if &req_modified == obj_modified {
+                // not modified
+                return Err(Error::NotModified(String::new()))
+            }
+        }
+    }
+    // modified
+    Ok(obj)
+}
+
+async fn try_get_object(mc: Arc<MetaCache>, key: &str)
+ -> Result<Option<(DataObject, Integrity)>, Error> {
+    if let Some(md) = mc.metadata_checked(key).await {
+        let sri = md.integrity;
+        // decode meta from json
+        let meta: ObjectMeta = serde_json::from_value(md.metadata)?;
+        // get stream from cache and construct object
+        let stream = read_stream(mc, sri.to_owned());
+        Ok(Some(
+            (DataObject {
+                meta,
+                stream,
+                status: None,
+            },
+            sri)
+        ))
     } else {
         Ok(None)
     }
 }
 
-fn save_stream<P: AsRef<Path>, K: AsRef<str>>(
-    path: P,
+fn save_stream<K>(
+    mc: Arc<MetaCache>,
     key: K,
     input: DataStream,
-    meta: ObjectMeta
-) -> DataStream {
-    let cache = {
-        let mut cache = PathBuf::new();
-        cache.push(path);
-        cache
-    };
-    let key = String::from(key.as_ref());
+    meta: &ObjectMeta
+) -> DataStream 
+where 
+    String: From<K> 
+{
+    // create metadata info for stream
+    let mut md = Metadata::new(key.into());
+    md.size = meta.content_length; // for check actual written size in commit
+    md.metadata = json!{meta};
+
     let stream = try_stream! {
         // create writer for store stream in cache
-        let mut fd = {
-            let opts = WriteOpts::new();
-            // add size info to check integrity on commit
-            if let Some(size) = meta.content_length  {
-                opts.size(size)
-            } else {
-                opts
-            }
-            .metadata(json!{meta})
-            .open(cache, key)
+        let mut fd = mc.writer(&md)
             .await
-            .map_err(|e| S3Error::Http(500, e.to_string()))?
-        };
-
+            .map_err(|e| S3Error::Http(500, e.to_string()))?;
         // read values from input
         for await value in input {
             if let Ok(ref value) = value {
                 // write value to cache file
                 fd.write_all(value)
                     .await
-                    .map_err(|e| S3Error::Io(e))?;
+                    .map_err(S3Error::Io)?;
             }
             // yield to stream
             yield value?;
         }
-        // check size and commit date in cache
+        // check size and commit in cache
         fd.commit()
             .await
             .map_err(|e| S3Error::Http(500, e.to_string()))?;
@@ -536,22 +560,17 @@ fn save_stream<P: AsRef<Path>, K: AsRef<str>>(
     Box::pin(stream)   
 }
 
-fn read_stream<P: AsRef<Path>>(
-    path: P, 
+fn read_stream(
+    mc: Arc<MetaCache>, 
     sri: Integrity
 ) -> DataStream {
-    let cache = {
-        let mut cache = PathBuf::new();
-        cache.push(path);
-        cache
-    };
     let stream = try_stream! {
         // open cache for reading
-        let mut fd = Reader::open_hash(cache, sri)
+        let mut fd = mc.reader(sri)
             .await
             .map_err(|e| S3Error::Http(500, e.to_string()))?;
         // read values from cache
-        let mut buf = BytesMut::with_capacity(rocket::response::Body::DEFAULT_MAX_CHUNK);    
+        let mut buf = BytesMut::with_capacity(rocket::response::Body::DEFAULT_MAX_CHUNK * 16);    
         while fd.read_buf(&mut buf).await? > 0 {
             let chunk = buf.split();
             yield chunk.freeze();
@@ -588,7 +607,7 @@ mod test {
 
     #[tokio::test]
     async fn double_write_cache() {
-        let dir = "./tests/my-cache1";
+        let dir = "./test-data/cache-1";
         let key = "my key";
 
         // write some data
@@ -606,11 +625,14 @@ mod test {
 
     #[tokio::test]
     async fn cache_stream() {
-        let dir = "./tests/my-cache2";
+        let dir = "./test-data/cache-2";
         let key = ObjectKey {
             bucket: "bucket1",
             key: Path::new("my key")
         }.cache_key();
+        let mc: Arc<MetaCache> = Arc::new(
+            MetaCache::new(PathBuf::from(dir), 10, None)
+            .unwrap());
 
         let meta1 = ObjectMeta { 
             content_type: Some(ContentType::HTML.to_string()), 
@@ -623,7 +645,7 @@ mod test {
         // input stream
         let input = Box::pin(
             stream! {
-                for i in (0..10) {
+                for i in 0..10 {
                     let item: StreamItem = Ok(Bytes::from(format!("hello {}\n", i)));
                     yield item
                 }
@@ -631,7 +653,7 @@ mod test {
         );
 
         // save input to cache and return persisted stream
-        let saved = save_stream(dir, &key, input, meta1.clone());
+        let saved = save_stream(Arc::clone(&mc), &key, input, &meta1);
         // read to buffer1
         let data1 = {
             let mut reader = StreamReader::new(saved);
@@ -639,16 +661,12 @@ mod test {
             reader.read_to_end(&mut data).await.unwrap();
             data
         };
-
-        // uncomment to pause to manually edit the cache file and cause the integrity check to fail
-        // press Enter in terminal to continue
-        //pause().await;
-
+      
         // get stream from cache
         let md = cacache::metadata(dir, &key).await.unwrap().unwrap();
         let sri = md.integrity;
         let meta2: ObjectMeta = serde_json::from_value(md.metadata).unwrap();
-        let cached = read_stream(dir, sri);
+        let cached = read_stream(Arc::clone(&mc), sri);
         // read to buffer2
         let data2 = {
             let mut reader = StreamReader::new(cached);
@@ -664,6 +682,7 @@ mod test {
         assert_eq!(meta1, meta2);
 
         // clean up the cache
+        mc.shutdown().await;
         cacache::clear(dir).await.unwrap();
     }
 

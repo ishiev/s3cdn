@@ -8,7 +8,10 @@ use s3::{
     region::Region,
 };
 use url::Url;
-use crate::cache::ConfigObjectCache;
+use crate::{
+    cache::ConfigObjectCache, 
+    housekeeper::ConfigHousekeeper
+};
 
 
 /// Configuration params for server
@@ -17,6 +20,7 @@ pub struct Config<'a> {
     pub ident: String,
     pub base_path: Origin<'a>,
     pub cache: Option<ConfigObjectCache>,
+    pub housekeeper: Option<ConfigHousekeeper>,
     pub creds: Credentials,
     pub connection: ConfigConnection,
 }
@@ -30,6 +34,7 @@ impl Default for Config<'_> {
             ),
             base_path: Origin::path_only("/"),
             cache: Default::default(),
+            housekeeper: Default::default(),
             creds: Credentials::anonymous().expect("Error create anonymous AWS credentials"),
             connection: Default::default(),
         }

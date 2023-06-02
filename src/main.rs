@@ -14,50 +14,21 @@ use rocket::{
     http::Status,
     Request, request::{FromRequest, Outcome},
 };
-use s3::{
-    Bucket,
-    error::S3Error,
-};
+use s3::Bucket;
 
 mod config;
 mod responder;
 mod cache;
+mod metacache;
+mod housekeeper;
+mod error;
 
 use crate::{
     config::Config,
     responder::CacheResponder,
     cache::{DataObject, ObjectKey, ObjectCache, ConditionalHeaders},
+    error::Error,
 };
-
-
-#[derive(Responder)]
-enum Error {
-    #[response(status = 304)]
-    NotModified(String),
-    #[response(status = 404)]
-    NotFound(String),
-    #[response(status = 403)]
-    Forbidden(String),
-    #[response(status = 503)]
-    Unavailable(String),
-    #[response(status = 500)]
-    Internal(String)
-}
-
-impl From<S3Error> for Error {
-    fn from(e: S3Error) -> Self {
-        match e {
-            S3Error::Http(304, e)   => Error::NotModified(e),
-            S3Error::Http(404, _)   => Error::NotFound(e.to_string()),
-            S3Error::Http(403, _)   => Error::Forbidden(e.to_string()),
-            S3Error::Credentials(_) => Error::Forbidden(e.to_string()),
-            S3Error::MaxExpiry(_)   => Error::Unavailable(e.to_string()),
-            S3Error::HttpFail       => Error::Unavailable(e.to_string()),
-            S3Error::Reqwest(e)     => Error::Unavailable(e.to_string()),
-            _ => Error::Internal(e.to_string())
-        }
-    }
-}
 
 #[catch(default)]
 fn default_catcher(status: Status, _: &Request) -> String {
@@ -101,13 +72,11 @@ async fn index<'r>(
     }
       
     // make origin source closure
-    let origin = | condition: Option<ConditionalHeaders> | {
+    let origin = | condition: ConditionalHeaders | {
         // add conditional headers for revalidate requests
-        if let Some(condition) = condition {
-            for h in condition.headers().into_iter() {
-                bucket.add_header(h.name().as_str(), h.value());
-            }
-        };
+        for h in condition.headers().into_iter() {
+            bucket.add_header(h.name().as_str(), h.value());
+        }
         // construct object path string
         let path = path.to_string_lossy();
         // return future to get object from origin with captured context
@@ -116,19 +85,13 @@ async fn index<'r>(
         }
     };
 
-    // get object from cache or revalidate from origin
-    let object = if condition.is_empty() {
-        // make object key for cache request
-        let key = ObjectKey {
-            bucket: bucket_name,
-            key: &path,
-        };
-        // get object from cache or from origin
-        cache.get_object(key, origin).await?
-    } else {
-        // revalidate from origin
-        origin(Some(condition)).await?
+    // make object key for cache request
+    let key = ObjectKey {
+        bucket: bucket_name,
+        key: &path,
     };
+    // get object from cache or revalidate
+    let object = cache.get_object(key, origin, condition).await?;
     
     Ok(CacheResponder::new(
         object,
@@ -136,8 +99,8 @@ async fn index<'r>(
     ))
 }
 
-#[launch]
-fn rocket() -> _ {
+#[rocket::main]
+async fn main() {
     // set configutation sources
     let figment = Figment::from(rocket::Config::default())
         .merge(Serialized::defaults(Config::default()))
@@ -147,10 +110,11 @@ fn rocket() -> _ {
         .select(Profile::from_env_or("S3CDN_PROFILE", "default"));
 
     // extract the config, exit if error
-    let mut config: Config = figment.extract().unwrap_or_else(|err| {
-        eprintln!("Problem parsing config: {err}");
-        process::exit(1)
-    });
+    let mut config: Config = figment.extract()
+        .unwrap_or_else(|err| {
+            eprintln!("Problem parsing config: {err}");
+            process::exit(1)
+        });
 
     // sure for S3 region created
     if config.connection.region.is_none() {
@@ -162,20 +126,43 @@ fn rocket() -> _ {
         }
     }
 
+    // setup cache
+    let cache = ObjectCache::new(
+            config.cache.take().unwrap_or_default(),
+            config.housekeeper.take()
+        )   
+        .unwrap_or_else(|err| {
+            eprintln!("Init error: {err}");
+            process::exit(1)
+        });
+
+
     println!("Starting {}, {}",
         env!("CARGO_PKG_DESCRIPTION"),
         config.ident
     );    
-    
-    // setup cache
-    let cache = ObjectCache::from(config.cache.take().unwrap_or_default());
 
     // set server base path from config
     let base_path = config.base_path.to_owned();
 
-    rocket::custom(figment)
-        .manage(config)
+    let res = rocket::custom(figment)
         .manage(cache)
+        .manage(config)
         .mount(base_path, routes![index])
         .register("/", catchers![default_catcher])
-}
+        .launch()
+        .await;
+
+    match res {
+        Ok(res) => {
+            if let Some(cache) = res.state::<ObjectCache>() {
+                // save cache and exiting
+                cache.shutdown().await;
+                info!("{} terminated.", env!("CARGO_PKG_DESCRIPTION"));
+            } 
+        },
+        Err(e) => {
+            error!("Abnormal termination: {}", e);
+        }
+    }
+ }
