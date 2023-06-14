@@ -99,7 +99,7 @@ async fn index(
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
+    pretty_env_logger::init_timed();
 
     // set configutation sources
     let figment = Figment::from(Serialized::defaults(Config::default()))
