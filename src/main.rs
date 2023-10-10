@@ -101,7 +101,7 @@ async fn index(
 async fn main() {
     pretty_env_logger::init_timed();
 
-    // set configutation sources
+    // set configuration sources
     let figment = Figment::from(Serialized::defaults(Config::default()))
         .merge(Toml::file("s3cdn.toml").nested())
         .merge(Toml::file("s3cdn-dev.toml").nested())
