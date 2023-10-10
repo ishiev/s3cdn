@@ -55,7 +55,8 @@ impl ConfigConnection {
         self.region = Some(Region::Custom { 
             region: "".to_string(), 
             endpoint: 
-                format!("{}:{}",
+                format!("{}://{}:{}",
+                    self.endpoint.scheme_str().unwrap_or("https"),
                     self.endpoint.host().unwrap_or_default(),
                     self.endpoint.port_u16().unwrap_or(80)
                 )
