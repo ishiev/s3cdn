@@ -99,8 +99,6 @@ async fn index(
 
 #[tokio::main]
 async fn main() {
-    pretty_env_logger::init_timed();
-
     // set configuration sources
     let figment = Figment::from(Serialized::defaults(Config::default()))
         .merge(Toml::file("s3cdn.toml").nested())
@@ -111,9 +109,21 @@ async fn main() {
     // extract the config, exit if error
     let mut config: Config = figment.extract()
         .unwrap_or_else(|err| {
-            error!("problem parsing config: {err}");
+            eprintln!("Error parsing config: {err}");
+            eprintln!("Process exit");
             process::exit(1)
         });
+
+    // init global logger with log level from config
+    {
+        let mut log_builder = pretty_env_logger::formatted_timed_builder();
+        if let Some(log_level) = &config.log_level  {
+            log_builder.parse_filters(log_level)            
+        } else {
+            &mut log_builder
+        }
+        .init();
+    }
 
     // sure for S3 region created
     if config.connection.region.is_none() {

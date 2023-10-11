@@ -17,6 +17,7 @@ use crate::{
 /// Configuration params for server
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
+    pub log_level: Option<String>,
     pub address: SocketAddr,
     #[serde(with = "http_serde::uri")]
     pub base_path: Uri,
@@ -29,12 +30,13 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            log_level: Default::default(),        
             address: SocketAddr::from(([127,0,0,1], 8000)),
             base_path: Default::default(),
             cache: Default::default(),
             housekeeper: Default::default(),
             creds: Credentials::anonymous().expect("error create anonymous AWS credentials"),
-            connection: Default::default(),        
+            connection: Default::default(),
         }
     }
 }
