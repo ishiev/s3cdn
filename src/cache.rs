@@ -12,7 +12,7 @@ use serde::{
 use serde_json::json;
 use ssri::Integrity;
 use std::{
-    path::{PathBuf}, 
+    path::PathBuf, 
     str::FromStr,
     time::SystemTime,
     collections::HashMap, 
@@ -434,7 +434,7 @@ impl ObjectCache {
             let max_age = self.config.max_age.unwrap_or_default();
             
             // check the object age
-            if age > max_age{
+            if age > max_age {
                 // object expired, need revalidation
                 let conditional = ConditionalHeaders::from(obj.meta.clone());
                 // request origin for revalidate
