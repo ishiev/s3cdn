@@ -2,7 +2,7 @@
 name = "s3cdn"
 description = "S3 Content Delivery Node"
 authors = ["Nikolay Ishiev <ishiev@primetver.ru>"]
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -24,7 +24,7 @@ aws-region = { version = "0.25.1", features = ["serde"] }
 rust-s3 = { git = "https://github.com/ishiev/rust-s3.git" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ssri = "8"
+ssri = "*"
 cacache = { version = "*", default-features = false, features = ["tokio-runtime"] }
 moka = { version = "0.10", features = ["future"] }
 sha1 = "0.10"
