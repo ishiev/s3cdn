@@ -1,6 +1,7 @@
 use bytes::BytesMut;
 use http::{header, HeaderMap, HeaderName};
 use httpdate::HttpDate;
+use log::error;
 use s3::{
     request::DataStream, 
     error::S3Error, 
@@ -546,21 +547,32 @@ where
         let mut fd = mc.writer(&md)
             .await
             .map_err(|e| S3Error::Http(500, e.to_string()))?;
+        let mut written: usize = 0;
         // read values from input
         for await value in input {
             if let Ok(ref value) = value {
                 // write value to cache file
                 fd.write_all(value)
                     .await
-                    .map_err(S3Error::Io)?;
+                    .map_err(|e| {
+                        error!("error writing to cache: {e}"); 
+                        S3Error::Io(e)
+                    })?;
+                written += value.len();
             }
-            // yield to stream
-            yield value?;
+            if md.size == Some(written) {
+                // commiting temprorary data in cache
+                fd.commit()
+                    .await
+                    .map_err(|e| S3Error::Http(500, e.to_string()))?;
+                // final yield lask chunk and exit
+                yield value?;
+                break;
+            } else {
+                // yield chunk to stream
+                yield value?;
+            }
         }
-        // check size and commit in cache
-        fd.commit()
-            .await
-            .map_err(|e| S3Error::Http(500, e.to_string()))?;
     };
     // return pinned stream
     Box::pin(stream)   
