@@ -10,7 +10,7 @@ use std::{
     fs::remove_file, 
     sync::Arc
 };
-use log::{debug, warn, error};
+use log::{debug, warn, error, info};
 use serde::{Deserialize, Serialize};
 use tokio::{task, time, sync::RwLock, select};
 use tokio_util::sync::CancellationToken;
@@ -89,7 +89,7 @@ fn housekeep(path: &Path, max_size: u64, max_duration: Option<Duration>) {
     let walkdir = WalkDir::new(path).follow_links(true);
     let mut files = BinaryHeap::new();
     
-    debug!("start checking cache storage");
+    info!("start checking cache storage");
     let mut dir_stat = DirStat::default();
     for entry in walkdir {
         match entry {
@@ -106,7 +106,7 @@ fn housekeep(path: &Path, max_size: u64, max_duration: Option<Duration>) {
             }
         }
     }
-    debug!("found {} files, storage size {} bytes",
+    info!("found {} file(s), storage size {} bytes",
         dir_stat.count, dir_stat.size);
 
     // phase 1: remove to time
@@ -121,12 +121,12 @@ fn housekeep(path: &Path, max_size: u64, max_duration: Option<Duration>) {
     removed_stat += remove_to_size(&mut files, size_to_remove);
 
     if removed_stat.count == 0 {
-        debug!("complete, nothing has been done");
+        info!("complete, nothing has been done");
         return;
     }
-    debug!("removed {} files, {} bytes",
+    info!("removed {} files, {} bytes",
         dir_stat.count, dir_stat.size);
-    debug!("complete, now we have {} files, storage size {} bytes", 
+    info!("complete, now we have {} file(s), storage size {} bytes", 
         dir_stat.count - removed_stat.count, 
         dir_stat.size - removed_stat.size
     );

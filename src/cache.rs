@@ -6,6 +6,7 @@ use s3::{
     request::DataStream, 
     error::S3Error, 
 };
+use core::time::Duration;
 use serde::{
     Deserialize, 
     Serialize,
@@ -18,7 +19,7 @@ use std::{
     time::SystemTime,
     collections::HashMap, 
     future::Future, 
-    sync::Arc 
+    sync::Arc, u64::MAX 
 };
 use tokio::io::{
     AsyncWriteExt, 
@@ -430,7 +431,10 @@ impl ObjectCache {
                 .unwrap_or(std::time::UNIX_EPOCH);
             let age = SystemTime::now()
                 .duration_since(time)
-                .unwrap_or_default()
+                .unwrap_or_else(|e| {
+                    error!("оbject age calculation error: {}, use MAX as u64", e);
+                    Duration::from_secs(MAX)
+                })
                 .as_secs();
             let max_age = self.config.max_age.unwrap_or_default();
             
