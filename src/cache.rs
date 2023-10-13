@@ -1,13 +1,12 @@
 use bytes::BytesMut;
+use http::{header, HeaderMap, HeaderName};
 use httpdate::HttpDate;
-use rocket::{
-    http::{Header, HeaderMap}, 
-    async_stream::try_stream, 
-};
+use log::{error, warn};
 use s3::{
     request::DataStream, 
     error::S3Error, 
 };
+use core::time::Duration;
 use serde::{
     Deserialize, 
     Serialize,
@@ -15,18 +14,18 @@ use serde::{
 use serde_json::json;
 use ssri::Integrity;
 use std::{
-    path::{PathBuf, Path}, 
+    path::PathBuf, 
     str::FromStr,
     time::SystemTime,
     collections::HashMap, 
     future::Future, 
-    borrow::Cow, 
-    sync::Arc 
+    sync::Arc, u64::MAX 
 };
 use tokio::io::{
     AsyncWriteExt, 
     AsyncReadExt
 };
+use async_stream::try_stream;
 use crate::{
     metacache::{MetaCache, Metadata},
     housekeeper::ConfigHousekeeper,
@@ -53,7 +52,7 @@ pub struct ConfigObjectCache {
 }
 
 impl ConfigObjectCache {
-    fn make_headers(&self) -> HeaderMap<'static> {
+    fn make_headers(&self) -> HeaderMap {
         let mut map = HeaderMap::new();
         // add cache-control header for external mode
         if self.mode == CacheMode::External {
@@ -68,28 +67,28 @@ impl ConfigObjectCache {
                 // not use stale resource, must revalidate or return error
                 String::from(", must-revalidate")
             };
-            map.add(Header::new(
-                "cache-control", 
-                format!("max-age={max_age}{stale_directive}")
-            ))
+            map.insert(
+                header::CACHE_CONTROL, 
+                format!("max-age={max_age}{stale_directive}").parse().unwrap()
+            );
         }
         map
     }
 }
 
-#[derive(Debug, Copy, Clone)]
-pub struct ObjectKey<'r> {
-    pub bucket: &'r str,
-    pub key: &'r Path,
+#[derive(Debug, Clone, Deserialize)]
+pub struct ObjectKey {
+    pub bucket: String,
+    pub key: String,
 }
 
-impl ObjectKey<'_> {
-    fn cache_key(&self) -> String {
-        format!("{}/{}", self.bucket, self.key.to_string_lossy())
+impl ObjectKey {
+    pub fn cache_key(&self) -> String {
+        format!("{}/{}", self.bucket, self.key)
     }
 }
 
-impl<'a> AsRef<ObjectKey<'a>> for ObjectKey<'a> {
+impl AsRef<ObjectKey> for ObjectKey {
     fn as_ref(&self) -> &Self { 
         self
     }
@@ -105,50 +104,53 @@ pub struct ObjectMeta {
 }
 
 impl ObjectMeta {
-    const CONTENT_LENGTH: &'static str = "content-length";    
-    const CONTENT_TYPE: &'static str = "content-type";
-    const DATE: &'static str = "date";
-    const LAST_MODIFIED: &'static str = "last-modified";
-    const ETAG: &'static str = "etag";
-
-    pub fn headers(&self) -> HeaderMap<'static> {
+    pub fn headers(&self) -> HeaderMap {
         let mut map = HeaderMap::new();
         if let Some(value) = self.content_length {
-            map.add_raw(Self::CONTENT_LENGTH, value.to_string());
+            map.insert(header::CONTENT_LENGTH, value.into());
         }
         if let Some(ref value) = self.content_type {
-            map.add_raw(Self::CONTENT_TYPE, value.to_string());
+            map.insert(header::CONTENT_TYPE, value.parse().unwrap());
         }
         if let Some(value) = self.date {
             let time = HttpDate::from(value);
-            map.add_raw(Self::DATE, time.to_string());
+            map.insert(header::DATE, time.to_string().parse().unwrap());
         }
         if let Some(value) = self.last_modified {
             let time = HttpDate::from(value);
-            map.add_raw(Self::LAST_MODIFIED, time.to_string());
+            map.insert(header::LAST_MODIFIED, time.to_string().parse().unwrap());
         }
         if let Some(ref value) = self.etag {
-            map.add_raw(Self::ETAG, value.to_string());
+            map.insert(header::ETAG, value.parse().unwrap());
         }
         map
     }
 }
 
-impl From<&HeaderMap<'_>> for ObjectMeta {
+impl From<&HeaderMap> for ObjectMeta {
     fn from(headers: &HeaderMap) -> Self {
         // read content length header
-        let content_length = headers.get_one(Self::CONTENT_LENGTH)
+        let content_length = headers.get(header::CONTENT_LENGTH)
+            .and_then(|h| h.to_str().ok())
             .and_then(|s| s.parse::<usize>().ok());     
         // read content-type header
-        let content_type = headers.get_one(Self::CONTENT_TYPE).map(String::from);
+        let content_type = headers.get(header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .map(String::from);
         // read & parse date header
-        let date = headers.get_one(Self::DATE)
-            .and_then(|t| HttpDate::from_str(t).ok().map(|x| x.into()));
+        let date = headers.get(header::DATE)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| HttpDate::from_str(s).ok())
+            .map(|x| x.into());
         // read & parse last-modified header
-        let last_modified = headers.get_one(Self::LAST_MODIFIED)
-            .and_then(|t| HttpDate::from_str(t).ok().map(|x| x.into()));
+        let last_modified = headers.get(header::LAST_MODIFIED)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| HttpDate::from_str(s).ok())
+            .map(|x| x.into());
         // read etag header
-        let etag = headers.get_one(Self::ETAG).map(String::from);
+        let etag = headers.get(header::ETAG)
+            .and_then(|h| h.to_str().ok())
+            .map(String::from);
 
         Self {
             content_length,
@@ -164,7 +166,11 @@ impl From<&HashMap<String, String>> for ObjectMeta {
     fn from(headers: &HashMap<String, String>) -> Self {
         let mut map = HeaderMap::new();
         for (name, value) in headers {
-            map.add_raw(name, value)
+            let Ok(key) = HeaderName::from_bytes(name.as_bytes())
+            else { continue };
+            let Ok(value) = value.parse()
+            else { continue };
+            map.insert(key, value);
         }
         Self::from(&map)
     }
@@ -172,34 +178,34 @@ impl From<&HashMap<String, String>> for ObjectMeta {
 
 // Values from conditional request
 #[derive(Default, Debug)]
-pub struct ConditionalHeaders<'r> {
-    if_modified_since: Option<Cow<'r, str>>,
-    if_none_match: Option<Cow<'r, str>>
+pub struct ConditionalHeaders {
+    if_modified_since: Option<String>,
+    if_none_match: Option<String>
 }
 
-impl<'r> ConditionalHeaders<'r> {
-    const IF_MODIFIED_SINCE: &'static str = "if-modified-since";
-    const IF_NONE_MATCH: &'static str = "if-none-match";
-
-    pub fn headers(self) -> HeaderMap<'r> {
+impl ConditionalHeaders {
+    pub fn headers(self) -> HeaderMap {
         let mut map = HeaderMap::new();
         if let Some(value) = self.if_modified_since {
-            map.add_raw(Self::IF_MODIFIED_SINCE, value);
+            if let Ok(value) = value.parse() {
+                map.insert(header::IF_MODIFIED_SINCE, value);
+            }
         }
         if let Some(value) = self.if_none_match {
-            map.add_raw(Self::IF_NONE_MATCH, value);
+            if let Ok(value) = value.parse() {
+                map.insert(header::IF_NONE_MATCH, value);
+            }
         }
         map
     }
 }
 
 /// Construct from object meta
-impl <'r> From<ObjectMeta> for ConditionalHeaders<'r> {
+impl From<ObjectMeta> for ConditionalHeaders {
     fn from(value: ObjectMeta) -> Self {
         let if_modified_since = value.last_modified
-            .map(|x| HttpDate::from(x).to_string().into());
-        let if_none_match = value.etag
-            .map(Cow::from);
+            .map(|x| HttpDate::from(x).to_string());
+        let if_none_match = value.etag;
         Self {
             if_modified_since,
             if_none_match
@@ -208,11 +214,15 @@ impl <'r> From<ObjectMeta> for ConditionalHeaders<'r> {
 }
 
 /// Construst from headers
-impl <'r> From<&'r HeaderMap<'r>> for ConditionalHeaders<'r> {
-    fn from(headers: &'r HeaderMap<'_>) -> Self {
+impl From<&HeaderMap> for ConditionalHeaders {
+    fn from(headers: &HeaderMap) -> Self {
         Self {
-            if_modified_since: headers.get_one(Self::IF_MODIFIED_SINCE).map(Cow::from),
-            if_none_match: headers.get_one(Self::IF_NONE_MATCH).map(Cow::from)
+            if_modified_since: headers.get(header::IF_MODIFIED_SINCE)
+                .and_then(|h| h.to_str().ok())
+                .map(String::from),
+            if_none_match: headers.get(header::IF_NONE_MATCH)
+                .and_then(|h| h.to_str().ok())
+                .map(String::from)
         }
     }
 }
@@ -221,7 +231,7 @@ impl <'r> From<&'r HeaderMap<'r>> for ConditionalHeaders<'r> {
 pub struct DataObject {
     pub meta: ObjectMeta,
     pub stream: DataStream,
-    pub status: Option<Header<'static>>
+    pub status: Option<&'static str>
 }
 
 /// Variants for cache object revalidation
@@ -236,7 +246,6 @@ enum ValidationResult {
 }
 
 impl ValidationResult {
-    const HEADER_NAME: &'static str = "x-s3cdn-status";
     const ORIGIN: &'static str = "Origin";
     const FRESH: &'static str = "Fresh";
     const REVALIDATED: &'static str = "Revalidated";
@@ -245,9 +254,9 @@ impl ValidationResult {
     const NOT_FOUND: &'static str = "NotFound";
     const ERROR: &'static str = "Error";
 
-    /// Make x-s3cdn-status header from &self
-    fn header(&self) -> Header<'static> {
-        let value = match self {
+    /// Make x-s3cdn-status str from &self
+    fn as_str(&self) -> &'static str {
+        match self {
             Self::Origin(_) => Self::ORIGIN,
             Self::Fresh(_) => Self::FRESH,
             Self::Revalidated(_) => Self::REVALIDATED,
@@ -255,15 +264,14 @@ impl ValidationResult {
             Self::Stale(_) => Self::STALE,
             Self::NotFound(_) => Self::NOT_FOUND,
             Self::Err(_) => Self::ERROR,
-        };
-        Header::new(Self::HEADER_NAME, value)
+        }
     }
 }
 
 /// Object cache
 pub struct ObjectCache {
     config: ConfigObjectCache,
-    headers: HeaderMap<'static>,
+    headers: HeaderMap,
     mc: Option<Arc<MetaCache>>,
 }
 
@@ -276,7 +284,7 @@ impl ObjectCache {
                 // path for cache storage
                 let path = config.root
                     .take()
-                    .ok_or(Error::Config("Cache root config param not defined!".to_string()))?;           
+                    .ok_or(Error::Config("Cache root config param not defined".to_string()))?;           
                 Some(Arc::new(
                     MetaCache::new(
                         path, 
@@ -299,16 +307,16 @@ impl ObjectCache {
     }
 
     /// Get cache-control headers for response
-    pub fn headers(&self) -> HeaderMap<'static> {
-        self.headers.to_owned()
+    pub fn headers(&self) -> HeaderMap {
+        self.headers.clone()
     }
 
     /// Get object from cache or from origin source, bypass if mode != Internal
-    pub async fn get_object<'a, K, F, Fut>(&self, key: K, origin: F, condition: ConditionalHeaders<'a>)
+    pub async fn get_object<'a, K, F, Fut>(&self, key: K, origin: F, condition: ConditionalHeaders)
     -> Result<DataObject, Error> 
     where 
-        K: AsRef<ObjectKey<'a>> + std::marker::Copy,
-        F: FnOnce(ConditionalHeaders<'a>)->Fut,
+        K: AsRef<ObjectKey> + std::marker::Copy,
+        F: FnOnce(ConditionalHeaders)->Fut,
         Fut: Future<Output = Result<DataObject, Error>>
     {
         let mc = match self.mc {
@@ -329,7 +337,7 @@ impl ObjectCache {
         
         // validate cache object
         let res = self.validate(obj, origin).await;
-        let status = res.header();
+        let status = res.as_str();
         
         // modify cache (if nessesary) and return result
         match res {
@@ -414,7 +422,7 @@ impl ObjectCache {
     async fn validate<'a, F, Fut>(&self, obj: Option<DataObject>, origin: F)
     -> ValidationResult 
     where
-        F: FnOnce(ConditionalHeaders<'a>)->Fut,
+        F: FnOnce(ConditionalHeaders)->Fut,
         Fut: Future<Output = Result<DataObject, Error>>
     {
         if let Some(obj) = obj {         
@@ -423,12 +431,15 @@ impl ObjectCache {
                 .unwrap_or(std::time::UNIX_EPOCH);
             let age = SystemTime::now()
                 .duration_since(time)
-                .unwrap_or_default()
+                .unwrap_or_else(|e| {
+                    error!("оbject age calculation error: {}, use MAX as u64", e);
+                    Duration::from_secs(MAX)
+                })
                 .as_secs();
             let max_age = self.config.max_age.unwrap_or_default();
             
             // check the object age
-            if age > max_age{
+            if age > max_age {
                 // object expired, need revalidation
                 let conditional = ConditionalHeaders::from(obj.meta.clone());
                 // request origin for revalidate
@@ -443,6 +454,7 @@ impl ObjectCache {
                         match self.config.use_stale {
                             Some(stale) if age < stale + max_age => {
                                 // can return stale object from cache
+                                warn!("got error from origin: {e}, but return object from cache due to use_stale={stale} config param");
                                 ValidationResult::Stale(obj)
                             },
                             _ => ValidationResult::Err(e)
@@ -540,21 +552,32 @@ where
         let mut fd = mc.writer(&md)
             .await
             .map_err(|e| S3Error::Http(500, e.to_string()))?;
+        let mut written: usize = 0;
         // read values from input
         for await value in input {
             if let Ok(ref value) = value {
                 // write value to cache file
                 fd.write_all(value)
                     .await
-                    .map_err(S3Error::Io)?;
+                    .map_err(|e| {
+                        error!("error writing to cache: {e}"); 
+                        S3Error::Io(e)
+                    })?;
+                written += value.len();
             }
-            // yield to stream
-            yield value?;
+            if md.size == Some(written) {
+                // commiting temprorary data in cache
+                fd.commit()
+                    .await
+                    .map_err(|e| S3Error::Http(500, e.to_string()))?;
+                // final yield lask chunk and exit
+                yield value?;
+                break;
+            } else {
+                // yield chunk to stream
+                yield value?;
+            }
         }
-        // check size and commit in cache
-        fd.commit()
-            .await
-            .map_err(|e| S3Error::Http(500, e.to_string()))?;
     };
     // return pinned stream
     Box::pin(stream)   
@@ -570,7 +593,7 @@ fn read_stream(
             .await
             .map_err(|e| S3Error::Http(500, e.to_string()))?;
         // read values from cache
-        let mut buf = BytesMut::with_capacity(rocket::response::Body::DEFAULT_MAX_CHUNK * 16);    
+        let mut buf = BytesMut::with_capacity(4096 * 16);    
         while fd.read_buf(&mut buf).await? > 0 {
             let chunk = buf.split();
             yield chunk.freeze();
@@ -583,10 +606,7 @@ fn read_stream(
 #[cfg(test)]
 mod test {
     use bytes::Bytes;
-    use rocket::{
-        http::ContentType, 
-        async_stream::stream
-    };
+    use async_stream::stream;
     use s3::request::StreamItem;
     use tokio::io::AsyncReadExt;
     use tokio_util::io::StreamReader;
@@ -627,15 +647,15 @@ mod test {
     async fn cache_stream() {
         let dir = "./test-data/cache-2";
         let key = ObjectKey {
-            bucket: "bucket1",
-            key: Path::new("my key")
+            bucket: "bucket1".to_owned(),
+            key: "my key".to_owned()
         }.cache_key();
         let mc: Arc<MetaCache> = Arc::new(
             MetaCache::new(PathBuf::from(dir), 10, None)
             .unwrap());
 
         let meta1 = ObjectMeta { 
-            content_type: Some(ContentType::HTML.to_string()), 
+            content_type: Some("text/html".to_string()), 
             content_length: Some(80),
             date: Some(SystemTime::now()),
             last_modified: Some(SystemTime::now()),
@@ -689,11 +709,11 @@ mod test {
     #[tokio::test]
     async fn object_meta_headers() {
         let mut headers = HeaderMap::new();
-        headers.add_raw("content-length", "12096836");
-        headers.add_raw("content-type", "image/jpeg");
-        headers.add_raw("date", HttpDate::from(SystemTime::now()).to_string());
-        headers.add_raw("last-modified", "Fri, 10 Feb 2023 09:57:33 GMT");
-        headers.add_raw("etag", "76febaf5c48e1e2c834c6663d0cbedcb");
+        headers.insert("content-length", "12096836".parse().unwrap());
+        headers.insert("content-type", "image/jpeg".parse().unwrap());
+        headers.insert("date", HttpDate::from(SystemTime::now()).to_string().parse().unwrap());
+        headers.insert("last-modified", "Fri, 10 Feb 2023 09:57:33 GMT".parse().unwrap());
+        headers.insert("etag", "76febaf5c48e1e2c834c6663d0cbedcb".parse().unwrap());
 
         let meta = ObjectMeta::from(&headers);
 

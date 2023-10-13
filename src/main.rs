@@ -1,20 +1,23 @@
-#[macro_use] extern crate rocket;
-
 use std::{
     process, 
-    path::PathBuf, 
-    time::Duration,
+    time::Duration, sync::Arc,
 };
-use rocket::{
-    figment::{
-        providers::{Env, Format, Serialized, Toml},
-        Figment, Profile,
-    }, 
-    State,
-    http::Status,
-    Request, request::{FromRequest, Outcome},
+use figment::{
+    providers::{Env, Format, Serialized, Toml},
+    Figment, Profile,
 };
+use axum::{
+    routing::get,
+    extract::{Path, State, FromRequestParts},
+    http::{request::Parts, Uri, StatusCode},
+    Router, 
+    async_trait, 
+    response::IntoResponse,
+};
+use axum_macros::debug_handler;
+use log::{info, debug, error};
 use s3::Bucket;
+use tokio::signal;
 
 mod config;
 mod responder;
@@ -25,85 +28,81 @@ mod error;
 
 use crate::{
     config::Config,
-    responder::CacheResponder,
     cache::{DataObject, ObjectKey, ObjectCache, ConditionalHeaders},
     error::Error,
 };
 
-#[catch(default)]
-fn default_catcher(status: Status, _: &Request) -> String {
-    format!("{}", status)
+const IDENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+
+/// Application state objects
+struct AppState {
+    config: Config,
+    cache: ObjectCache,
 }
 
-/// Request guard for conditional headers
-#[rocket::async_trait]
-impl<'r> FromRequest<'r> for ConditionalHeaders<'r> {
-    type Error = std::convert::Infallible;
+/// Fallback handler
+async fn fallback(uri: Uri) -> (StatusCode, String) {
+    (StatusCode::NOT_FOUND, format!("No route for {}", uri))
+}
 
-    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        Outcome::Success(
-            ConditionalHeaders::from(req.headers())
-        )
+/// Request extractor for conditional headers
+#[async_trait]
+impl<S> FromRequestParts<S> for ConditionalHeaders
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(ConditionalHeaders::from(&parts.headers))
     }
 }
 
-#[get("/<bucket_name>/<path..>")]
-async fn index<'r>(
-    bucket_name: &'r str,
-    path: PathBuf,
-    condition: ConditionalHeaders<'_>,
-    config: &State<Config<'_>>,
-    cache: &'r State<ObjectCache>,
-) -> Result<CacheResponder<'r, 'static, DataObject>, Error> {
+#[debug_handler]
+async fn index(
+    Path(obj): Path<ObjectKey>,
+    condition: ConditionalHeaders,
+    State(app): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, Error> {
+    let cache_key = obj.cache_key();
+    info!("received request to object {cache_key}");
     // configure S3 Bucket
     let mut bucket = Bucket::new(
-        bucket_name, 
-        config.connection.region.as_ref().unwrap().to_owned(), 
-        config.creds.to_owned()
-    )?;
-    
+        &obj.bucket, 
+        app.config.connection.region.as_ref().unwrap().to_owned(), 
+        app.config.creds.to_owned()
+    )?; 
     // set timeout from config or infinite
-    bucket.set_request_timeout(config.connection.timeout.map(Duration::from_secs));
+    bucket.set_request_timeout(app.config.connection.timeout.map(Duration::from_secs));
     // set path- or virtual host bucket style 
-    if config.connection.pathstyle {
+    if app.config.connection.pathstyle {
         bucket.set_path_style();
     } else {
         bucket.set_subdomain_style();
     }
-      
     // make origin source closure
     let origin = | condition: ConditionalHeaders | {
         // add conditional headers for revalidate requests
-        for h in condition.headers().into_iter() {
-            bucket.add_header(h.name().as_str(), h.value());
+        for (key, val) in condition.headers().iter() {
+            let Ok(val) = val.to_str() else { continue };
+            bucket.add_header(key.as_str(), val);
         }
-        // construct object path string
-        let path = path.to_string_lossy();
         // return future to get object from origin with captured context
+        let path = obj.key.to_owned();
         async move {
             Ok(DataObject::from(bucket.get_object_stream(path).await?))
         }
     };
-
-    // make object key for cache request
-    let key = ObjectKey {
-        bucket: bucket_name,
-        key: &path,
-    };
     // get object from cache or revalidate
-    let object = cache.get_object(key, origin, condition).await?;
-    
-    Ok(CacheResponder::new(
-        object,
-        cache
-    ))
+    let object = app.cache.get_object(&obj, origin, condition).await?;
+    info!("return {} object {cache_key}", object.status.unwrap_or("unknown"));
+    Ok((app.cache.headers(), object))
 }
 
-#[rocket::main]
+#[tokio::main]
 async fn main() {
-    // set configutation sources
-    let figment = Figment::from(rocket::Config::default())
-        .merge(Serialized::defaults(Config::default()))
+    // set configuration sources
+    let figment = Figment::from(Serialized::defaults(Config::default()))
         .merge(Toml::file("s3cdn.toml").nested())
         .merge(Toml::file("s3cdn-dev.toml").nested())
         .merge(Env::prefixed("S3CDN").global())
@@ -112,19 +111,28 @@ async fn main() {
     // extract the config, exit if error
     let mut config: Config = figment.extract()
         .unwrap_or_else(|err| {
-            eprintln!("Problem parsing config: {err}");
+            eprintln!("Error parsing config: {err}");
+            eprintln!("Process exit");
             process::exit(1)
         });
 
+    // init global logger with log level from config
+    {
+        let mut log_builder = pretty_env_logger::formatted_timed_builder();
+        if let Some(log_level) = &config.log_level  {
+            log_builder.parse_filters(log_level)            
+        } else {
+            &mut log_builder
+        }
+        .init();
+    }
+
     // sure for S3 region created
     if config.connection.region.is_none() {
-        if config.connection.endpoint.is_none() {
-            eprintln!("S3 connection endpoint not found in config, set \"config.connection.endpoint\" param!");
-            process::exit(1)
-        } else {
-            config.connection.make_custom_region();
-        }
+        config.connection.make_custom_region();
     }
+
+    info!("starting {}, {IDENT}", env!("CARGO_PKG_DESCRIPTION")); 
 
     // setup cache
     let cache = ObjectCache::new(
@@ -132,37 +140,69 @@ async fn main() {
             config.housekeeper.take()
         )   
         .unwrap_or_else(|err| {
-            eprintln!("Init error: {err}");
+            error!("cache init error: {err}");
             process::exit(1)
-        });
+        }
+    );
 
+    // make app state
+    let app = Arc::new(
+        AppState {
+            config,
+            cache
+        }
+    );
 
-    println!("Starting {}, {}",
-        env!("CARGO_PKG_DESCRIPTION"),
-        config.ident
-    );    
+    // build our application with a route
+    let s3_route = Router::new()
+        // `GET /` goes to `/<bucket_name>/<key..>`
+        .route("/:bucket/*key", get(index))
+        .with_state(Arc::clone(&app));
 
-    // set server base path from config
-    let base_path = config.base_path.to_owned();
+    let app_route = Router::new()
+        .nest(app.config.base_path.path(), s3_route)
+        .fallback(fallback);
 
-    let res = rocket::custom(figment)
-        .manage(cache)
-        .manage(config)
-        .mount(base_path, routes![index])
-        .register("/", catchers![default_catcher])
-        .launch()
+    // run our app with hyper
+    // `axum::Server` is a re-export of `hyper::Server`
+    let addr = app.config.address;
+    debug!("listening on {}", addr);
+    let res = axum::Server::bind(&addr)
+        .serve(app_route.into_make_service())
+        .with_graceful_shutdown(shutdown_signal())
         .await;
-
+    // server shutdown procedures
     match res {
-        Ok(res) => {
-            if let Some(cache) = res.state::<ObjectCache>() {
-                // save cache and exiting
-                cache.shutdown().await;
-                info!("{} terminated.", env!("CARGO_PKG_DESCRIPTION"));
-            } 
+        Ok(_) => {
+            // save cache and exiting
+            app.cache.shutdown().await;
+            info!("{} finished", env!("CARGO_PKG_DESCRIPTION"));
         },
         Err(e) => {
-            error!("Abnormal termination: {}", e);
+            error!("abnormal termination: {}", e);
         }
     }
  }
+
+ async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    // await for signals
+    let sig = tokio::select! {
+        _ = ctrl_c => { "Ctrl+C" },
+        _ = terminate => { "SIGTERM" },
+    };
+    info!("signal {sig} received, starting graceful shutdown");
+}

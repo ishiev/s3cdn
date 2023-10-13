@@ -1,4 +1,4 @@
-use rocket::http::uri::Origin;
+use std::net::SocketAddr;
 use serde::{
     Deserialize, 
     Serialize,
@@ -7,7 +7,7 @@ use s3::{
     creds::Credentials,
     region::Region,
 };
-use url::Url;
+use http::Uri;
 use crate::{
     cache::ConfigObjectCache, 
     housekeeper::ConfigHousekeeper
@@ -16,26 +16,26 @@ use crate::{
 
 /// Configuration params for server
 #[derive(Debug, Deserialize, Serialize)]
-pub struct Config<'a> {
-    pub ident: String,
-    pub base_path: Origin<'a>,
+pub struct Config {
+    pub log_level: Option<String>,
+    pub address: SocketAddr,
+    #[serde(with = "http_serde::uri")]
+    pub base_path: Uri,
     pub cache: Option<ConfigObjectCache>,
     pub housekeeper: Option<ConfigHousekeeper>,
     pub creds: Credentials,
     pub connection: ConfigConnection,
 }
 
-impl Default for Config<'_> {
+impl Default for Config {
     fn default() -> Self {
         Self {
-            ident: format!("{}/{}", 
-                env!("CARGO_PKG_NAME"), 
-                env!("CARGO_PKG_VERSION")
-            ),
-            base_path: Origin::path_only("/"),
+            log_level: Default::default(),        
+            address: SocketAddr::from(([127,0,0,1], 8000)),
+            base_path: Default::default(),
             cache: Default::default(),
             housekeeper: Default::default(),
-            creds: Credentials::anonymous().expect("Error create anonymous AWS credentials"),
+            creds: Credentials::anonymous().expect("error create anonymous AWS credentials"),
             connection: Default::default(),
         }
     }
@@ -45,7 +45,8 @@ impl Default for Config<'_> {
 #[derive(Default, Debug, Deserialize, Serialize)]
 pub struct ConfigConnection {
     pub region: Option<Region>,
-    pub endpoint: Option<Url>,
+    #[serde(with = "http_serde::uri")]
+    pub endpoint: Uri,
     pub pathstyle: bool,
     pub timeout: Option<u64>,
 }
@@ -55,14 +56,12 @@ impl ConfigConnection {
     pub fn make_custom_region(&mut self) {
         self.region = Some(Region::Custom { 
             region: "".to_string(), 
-            endpoint: if let Some(endpoint) = &self.endpoint {
-                format!("{}:{}",
-                    endpoint.host_str().unwrap_or_default(),
-                    endpoint.port_or_known_default().unwrap_or(80)
+            endpoint: 
+                format!("{}://{}:{}",
+                    self.endpoint.scheme_str().unwrap_or("https"),
+                    self.endpoint.host().unwrap_or_default(),
+                    self.endpoint.port_u16().unwrap_or(80)
                 )
-            } else {
-                "".to_string()
-            }
         })
     } 
 }

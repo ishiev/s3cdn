@@ -10,7 +10,7 @@ use std::{
     fs::remove_file, 
     sync::Arc
 };
-
+use log::{debug, warn, error, info};
 use serde::{Deserialize, Serialize};
 use tokio::{task, time, sync::RwLock, select};
 use tokio_util::sync::CancellationToken;
@@ -89,24 +89,24 @@ fn housekeep(path: &Path, max_size: u64, max_duration: Option<Duration>) {
     let walkdir = WalkDir::new(path).follow_links(true);
     let mut files = BinaryHeap::new();
     
-    debug!("Housekeeper: start checking cache storage...");
+    info!("start checking cache storage");
     let mut dir_stat = DirStat::default();
     for entry in walkdir {
         match entry {
             Ok(entry) if entry.file_type().is_file() => {
                 let entry = TimeOrdEntry::from(entry);
-                debug!("Houkeeper: found {:?}, size: {}, time: {:?}", entry.path, entry.size, entry.time);
+                debug!("found {:?}, size: {}, time: {:?}", entry.path, entry.size, entry.time);
                 dir_stat += (1, entry.size).into();
                 // sort min first
                 files.push(Reverse(entry))
             },
             Ok(_) => continue,
             Err(e) => {
-                error!("Housekeeper: error reading storage: {e}")
+                error!("error reading storage: {e}")
             }
         }
     }
-    debug!("Housekeeper: found {} files, storage size {} bytes",
+    info!("found {} file(s), storage size {} bytes",
         dir_stat.count, dir_stat.size);
 
     // phase 1: remove to time
@@ -121,12 +121,12 @@ fn housekeep(path: &Path, max_size: u64, max_duration: Option<Duration>) {
     removed_stat += remove_to_size(&mut files, size_to_remove);
 
     if removed_stat.count == 0 {
-        debug!("Housekeeper: complete, nothing has been done.");
+        info!("complete, nothing has been done");
         return;
     }
-    debug!("Housekeeper: removed {} files, {} bytes",
+    info!("removed {} files, {} bytes",
         dir_stat.count, dir_stat.size);
-    debug!("Housekeeper: complete, now we have {} files, storage size {} bytes", 
+    info!("complete, now we have {} file(s), storage size {} bytes", 
         dir_stat.count - removed_stat.count, 
         dir_stat.size - removed_stat.size
     );
@@ -156,7 +156,7 @@ fn remove_to_size(files: &mut OldestFirstHeap, mut size_to_remove: u64) -> DirSt
             else { break };
             // remove file
             if let Err(e) = remove_file(&entry.1.path) {
-                error!("Housekeeper: error removing cache file {:?}: {e}", &entry.1.path);
+                error!("error removing cache file {:?}: {e}", &entry.1.path);
             } else {
                 // calculate statictics
                 removed_stat += (1, entry.1.size).into();
@@ -184,7 +184,7 @@ fn remove_to_time(files: &mut OldestFirstHeap, time_to_remove: SystemTime) -> Di
         if entry.0.time < Some(time_to_remove) {
             // remove file if oldest than given
             if let Err(e) = remove_file(&entry.0.path) {
-                error!("Housekeeper: error removing cache file {:?}: {e}", &entry.0.path);
+                error!("error removing cache file {:?}: {e}", &entry.0.path);
             } else {
                 // calculate statictics
                 removed_stat += (1, entry.0.size).into();
@@ -242,15 +242,15 @@ impl Housekeeper {
                             housekeep(&path, config.max_size, max_duration)
                         }).await;
                         if let Err(e) = res {
-                            error!("Housekeeper task execution error {e}");
+                            error!("task execution error {e}");
                         }
                     }
                 }
             }
-            debug!("Housekeeper task finished.");
+            debug!("housekeeper task finished");
         };
         // start task and save to struct option
-        debug!("Housekeeper task started.");
+        debug!("task sheduler started");
         Self {
             task: RwLock::new(Some(
                 (
@@ -266,11 +266,11 @@ impl Housekeeper {
         if let Some(task) = self.task.write().await.take() {
             // cancel request
             task.1.cancel();
-            debug!("Waiting for housekeeper task...");
+            debug!("waiting for housekeeper task");
             // waiting for task exit
             task.0.await.ok();
         } else {
-            warn!("Housekeeper task already exited.");
+            warn!("task already exited");
         }  
     }
 }

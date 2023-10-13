@@ -21,6 +21,7 @@ use tokio::{
     task::{self, JoinHandle}
 };
 use sha1::{Sha1, Digest};
+use log::{info, debug, warn, error};
 
 use crate::housekeeper::{Housekeeper, ConfigHousekeeper};
 
@@ -97,20 +98,20 @@ impl Metadata {
             md.index_meta = index_meta(cache, &self.key).await.ok();
             if md == *self {
                 // already saved, do nothing
-                debug!("Drop metadata for key: {} (already saved), reason: {}", &self.key, reason);
+                debug!("drop metadata for key: {} (already saved), reason: {}", &self.key, reason);
                 return
             } else if Some(md.time) > Some(self.time) {
                 // saved medatada is newer than our, do nothing
-                debug!("Drop metadata for key: {} (older than saved), reason: {}", &self.key, reason);
+                debug!("drop metadata for key: {} (older than saved), reason: {}", &self.key, reason);
                 return
             }
         }
         // insert to index
         let opts = WriteOpts::from(self);
         if let Err(e) = cacache::index::insert_async(cache, &self.key, opts).await {
-            error!("Error save cache metadata: {}", e);
+            error!("error save cache metadata: {}", e);
         } else {
-            debug!("Save metadata for key: {}, reason: {}", &self.key, reason)
+            debug!("save metadata for key: {}, reason: {}", &self.key, reason)
         }
     }
 }
@@ -172,7 +173,7 @@ impl IndexWriter {
                     WriterCommand::Exit => break
                 }
             }
-            debug!("Index writer task finished.");
+            debug!("index writer task finished");
         });
         Self { task: RwLock::new(Some(task)), tx }
     }
@@ -180,14 +181,14 @@ impl IndexWriter {
     async fn exit(&self) {
         if let Err(e) = self.tx.send(WriterCommand::Exit).await {
             // receiver dropped
-            error!("Writer task receiver dropped: {}", e);         
+            error!("writer task receiver dropped: {}", e);         
             return
         }
         if let Some(task) = self.task.write().await.take() {
-            debug!("Waiting for index writer task...");
+            debug!("waiting for index writer task");
             task.await.ok();
         } else {
-            warn!("Writer task already exited.");
+            warn!("writer task already exited");
         }   
     }
 
@@ -231,7 +232,7 @@ impl MetaCache {
                     tx.blocking_send(
                         WriterCommand::Write(md, Cow::from(format!("{:?}", cause))))
                         .unwrap_or_else(|e| {
-                            error!("Error save cache metadata: {}", e);
+                            error!("error save cache metadata: {}", e);
                         })
                 }
             };
@@ -252,12 +253,12 @@ impl MetaCache {
     }
 
     pub async fn shutdown(&self) {
-        info!("Start cache shutdown, saving metadata to index: {} element(s)...", self.cache.entry_count());
+        info!("start shutdown, saving metadata to index: {} element(s)", self.cache.entry_count());
         for (_key, md) in self.cache.iter() {
             self.writer.write(md, Cow::from("Shutdown"))
                 .await
                 .unwrap_or_else(|e| {
-                    error!("Error send save command: {}", e);
+                    error!("error send save command: {}", e);
                 });
         }
         // exit writer task
@@ -266,7 +267,7 @@ impl MetaCache {
         if let Some(ref keeper) = self.keeper {
             keeper.exit().await
         }
-        info!("Cache shutdown complete.");
+        info!("shutdown complete");
     }
 
     pub async fn metadata(&self, key: &str) -> Option<Metadata> {
@@ -276,7 +277,7 @@ impl MetaCache {
             Metadata::read(&self.path, key)
                 .await
                 .unwrap_or_else(|e| {
-                    error!("Error read index: {}", e);
+                    warn!("error read index: {}", e);
                     None
                 })
                 .map(Arc::new)
@@ -468,7 +469,7 @@ mod test {
         }
 
         // saving to index
-        println!("start saving cache to index...");
+        println!("start saving cache to index");
         let t0 = Instant::now();
         mc.shutdown().await;
         let t_write = t0.elapsed().as_secs_f32();
@@ -476,7 +477,7 @@ mod test {
         assert!(t_write < 20.0);
 
         // now we can get it back
-        println!("start reading cache from index...");
+        println!("start reading cache from index");
         let t0 = Instant::now();
         let mut md2: Vec<Metadata> = Vec::with_capacity(ITEMS);
         for x in keys.iter() {
