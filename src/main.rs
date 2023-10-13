@@ -65,7 +65,7 @@ async fn index(
     State(app): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, Error> {
     let cache_key = obj.cache_key();
-    info!("received request to object /{}", cache_key);
+    info!("received request to object {cache_key}");
     // configure S3 Bucket
     let mut bucket = Bucket::new(
         &obj.bucket, 
@@ -95,7 +95,7 @@ async fn index(
     };
     // get object from cache or revalidate
     let object = app.cache.get_object(&obj, origin, condition).await?;
-    info!("return /{}, with {} status", cache_key, object.status.unwrap_or("unknown"));
+    info!("return {} object {cache_key}", object.status.unwrap_or("unknown"));
     Ok((app.cache.headers(), object))
 }
 

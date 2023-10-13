@@ -38,7 +38,7 @@ impl IntoResponse for Error {
             Error::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let msg = self.to_string();
-        warn!("return response with status: {status}, message: {msg}"); 
+        warn!("return error with {status} status, message: {msg}"); 
         // calling other implementations    
         (status, msg).into_response()
     }

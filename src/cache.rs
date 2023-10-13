@@ -1,7 +1,7 @@
 use bytes::BytesMut;
 use http::{header, HeaderMap, HeaderName};
 use httpdate::HttpDate;
-use log::error;
+use log::{error, warn};
 use s3::{
     request::DataStream, 
     error::S3Error, 
@@ -454,6 +454,7 @@ impl ObjectCache {
                         match self.config.use_stale {
                             Some(stale) if age < stale + max_age => {
                                 // can return stale object from cache
+                                warn!("got error from origin: {e}, but return object from cache due to use_stale={stale} config param");
                                 ValidationResult::Stale(obj)
                             },
                             _ => ValidationResult::Err(e)
